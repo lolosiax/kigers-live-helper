@@ -1,0 +1,11 @@
+.gradle/
+build/
+**/build/
+.kotlin/
+.idea/
+*.iml
+local.properties
+out/
+*.log
+.DS_Store
+/cmake-build-*/
