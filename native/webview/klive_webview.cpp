@@ -252,6 +252,8 @@ struct UiContext {
     int min_width = 920;
     int min_height = 640;
     bool devtools = false;
+    void (*open_console)(void*) = nullptr;
+    void* open_console_user = nullptr;
 
     std::promise<int32_t> init;
     std::atomic<bool> init_done{false};
@@ -424,6 +426,14 @@ json Dispatch(const std::string& method, const json& params) {
     }
     if (method == "lastMessage") {
         return CaptureMessage();
+    }
+    if (method == "openConsole") {
+        if (g_ui == nullptr || g_ui->open_console == nullptr) {
+            throw BridgeError{KLIVE_WEBVIEW_E_INVALID_ARG, "当前宿主不支持打开终端"};
+        }
+        g_ui->open_console(g_ui->open_console_user);
+        Log("[webview] console requested");
+        return nullptr;
     }
     if (method == "stopMirror") {
         int32_t code = g_api.stop_mirror();
@@ -1082,6 +1092,8 @@ int32_t klive_webview_start(const klive_webview_config* config) {
     context->min_width = config->min_width > 0 ? config->min_width : 920;
     context->min_height = config->min_height > 0 ? config->min_height : 640;
     context->devtools = config->enable_devtools != 0;
+    context->open_console = config->open_console;
+    context->open_console_user = config->open_console_user;
 
     if (!LoadCaptureApi(context->native_dir)) {
         delete context;

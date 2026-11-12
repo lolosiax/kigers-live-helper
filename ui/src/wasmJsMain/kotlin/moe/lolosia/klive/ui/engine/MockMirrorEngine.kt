@@ -91,5 +91,7 @@ class MockMirrorEngine : MirrorEngine {
 
     override suspend fun lastMessage(): String? = null
 
+    override suspend fun openConsole(): String? = null
+
     override fun shutdown() = Unit
 }

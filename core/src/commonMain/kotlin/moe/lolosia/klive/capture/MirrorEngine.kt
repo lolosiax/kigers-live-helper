@@ -27,5 +27,8 @@ interface MirrorEngine {
 
     suspend fun lastMessage(): String?
 
+    /** 请求打开 keel 控制台窗口；成功返回 null，失败返回可展示的错误描述。 */
+    suspend fun openConsole(): String?
+
     fun shutdown()
 }

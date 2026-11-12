@@ -20,6 +20,7 @@ class KlivePlugin : Plugin {
 
     override fun onLoad(context: PluginContext) {
         this.context = context
+        WebConsole.attach(context.server.messenger)
     }
 
     override fun onEnable() {

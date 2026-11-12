@@ -13,3 +13,6 @@ out/
 # 工具 / 截图产物
 .screenshots/
 .trae-html-share-packages/
+
+# Host 运行日志与崩溃报告（从仓库根启动时生成）
+work/

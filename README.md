@@ -71,8 +71,9 @@ keel-plugin-klive/  keel 插件：物化 DLL 与 wasm，拉起外壳
 .\gradlew.bat :keel-plugin-klive:keelRun
 ```
 
-单 exe 内嵌插件包与 wasm 面板，双击即可运行；首次运行会在 exe 同目录创建 `plugins/` 与
-`.cache/`（目录不可写时改用用户缓存目录）。目标机仍需安装 WebView2 Runtime。
+单 exe 以桌面应用模式启动（GUI 子系统，不弹控制台），内嵌控制面板与 `keel-plugin-console`；
+首次运行会在 exe 同目录创建 `plugins/` 与 `.cache/`（目录不可写时改用用户缓存目录）。
+目标机仍需安装 WebView2 Runtime。
 
 只调面板布局时可以直接在浏览器里跑（Mock 引擎，不碰原生层）：
 `.\gradlew.bat :ui:wasmJsBrowserDevelopmentRun`。
@@ -81,8 +82,9 @@ keel-plugin-klive/  keel 插件：物化 DLL 与 wasm，拉起外壳
 
 1. 左侧选采集源：切「显示器」或「窗口」；显示器还可切「桌面复制 / WGC」后端。右侧选目标显示器（可切换等比填充 / 拉伸铺满、垂直同步）。
 2. 点「开始镜像」，目标显示器立即被镜像窗口覆盖。
-3. 退出镜像：`Ctrl + Alt + Q`；镜像窗口拿到焦点时按 `Esc` 也可以。
-4. 关闭面板只会缩到托盘；托盘菜单可以「显示面板 / 停止镜像 / 退出」。
+3. 顶部「打开终端」会打开 keel 控制台窗口，可查看日志、执行 `help` / `plugins` 等 Host 命令。
+4. 退出镜像：`Ctrl + Alt + Q`；镜像窗口拿到焦点时按 `Esc` 也可以。
+5. 关闭面板只会缩到托盘；托盘菜单可以「显示面板 / 停止镜像 / 退出」。
 
 ## 限制
 

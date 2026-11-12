@@ -16,14 +16,19 @@ keelPlugin {
     executable {
         enabled = true
         name = "KigerLiveHelper"
+        // 桌面应用：GUI 子系统，双击不弹控制台；日志与命令走「打开终端」的 console 插件
+        console = false
         // 上游目前只发布 debug launcher；release 包就绪后再切
         buildType = "DEBUG"
+        include("moe.lolosia.keel.plugins:keel-plugin-console:${libs.versions.keel.get()}@keel")
         windows {
             productName = "Kiger's Live Helper"
             fileDescription = "Kiger's Live Helper"
             companyName = "lolosia"
         }
     }
+    // keelRun 也带上 console 插件，便于在开发时验证「打开终端」
+    runPlugin("moe.lolosia.keel.plugins:keel-plugin-console:${libs.versions.keel.get()}@keel")
     // 桥日志默认关闭（每秒多条，会把 keel 控制台刷满）；需要时加 -Pklive.bridgeLog
     if (providers.gradleProperty("klive.bridgeLog").isPresent) {
         runEnv("KLIVE_WEBVIEW_LOG", "1")

@@ -3,6 +3,7 @@ package moe.lolosia.klive.plugin
 import klive_webview.klive_webview_config
 import kotlinx.cinterop.ByteVar
 import kotlinx.cinterop.CFunction
+import kotlinx.cinterop.COpaquePointer
 import kotlinx.cinterop.CPointer
 import kotlinx.cinterop.ExperimentalForeignApi
 import kotlinx.cinterop.UShortVar
@@ -13,6 +14,7 @@ import kotlinx.cinterop.invoke
 import kotlinx.cinterop.memScoped
 import kotlinx.cinterop.ptr
 import kotlinx.cinterop.reinterpret
+import kotlinx.cinterop.staticCFunction
 import kotlinx.cinterop.toKString
 import platform.windows.FreeLibrary
 import platform.windows.GetFullPathNameW
@@ -46,6 +48,8 @@ internal class WebViewShell private constructor(
         config.min_height = 640
         config.enable_devtools = if (devtools) 1 else 0
         config.reserved = 0
+        config.open_console = staticCFunction(::notifyOpenConsole)
+        config.open_console_user = null
         startFn(config.ptr)
     }
 
@@ -94,4 +98,9 @@ internal class WebViewShell private constructor(
             }
         }
     }
+}
+
+/** WebView2 UI 线程点击「打开终端」时进入插件运行时；实现只投递消息，不能抛异常。 */
+private fun notifyOpenConsole(@Suppress("UNUSED_PARAMETER") user: COpaquePointer?) {
+    WebConsole.open()
 }

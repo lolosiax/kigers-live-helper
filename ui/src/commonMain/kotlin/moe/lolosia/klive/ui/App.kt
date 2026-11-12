@@ -124,7 +124,16 @@ fun App(engine: MirrorEngine) {
     Column(
         modifier = Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background).padding(24.dp),
     ) {
-        Header(running = running, onRefresh = { scope.launch { refresh() } })
+        Header(
+            running = running,
+            onRefresh = { scope.launch { refresh() } },
+            onOpenConsole = {
+                scope.launch {
+                    val error = engine.openConsole()
+                    if (error != null) message = error
+                }
+            },
+        )
         Spacer(Modifier.height(20.dp))
 
         Row(modifier = Modifier.weight(1f).fillMaxWidth()) {
@@ -213,7 +222,7 @@ fun App(engine: MirrorEngine) {
 }
 
 @Composable
-private fun Header(running: Boolean, onRefresh: () -> Unit) {
+private fun Header(running: Boolean, onRefresh: () -> Unit, onOpenConsole: () -> Unit) {
     Row(verticalAlignment = Alignment.CenterVertically) {
         Box(
             modifier = Modifier.size(38.dp)
@@ -241,6 +250,7 @@ private fun Header(running: Boolean, onRefresh: () -> Unit) {
         Spacer(Modifier.weight(1f))
         StatusPill(running)
         Spacer(Modifier.width(8.dp))
+        TextButton(onClick = onOpenConsole) { Text("打开终端") }
         TextButton(onClick = onRefresh) { Text("重新枚举") }
     }
 }

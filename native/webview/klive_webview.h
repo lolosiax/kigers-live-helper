@@ -44,6 +44,12 @@ typedef struct klive_webview_config {
     int32_t min_height;
     int32_t enable_devtools;
     int32_t reserved;
+    /*
+     * 「打开终端」回调，可空。由插件注入，在 UI 线程上调用；
+     * 实现只应把请求投递给 keel 事件泵，不得阻塞 UI 线程。
+     */
+    void (*open_console)(void* user_data);
+    void* open_console_user;
 } klive_webview_config;
 
 /*

@@ -91,6 +91,11 @@ class WasmMirrorEngine(private val bridge: Bridge) : MirrorEngine {
         return result.jsonPrimitive.contentOrNull?.takeIf { it.isNotBlank() }
     }
 
+    override suspend fun openConsole(): String? =
+        runCatching { bridge.call("openConsole") }
+            .exceptionOrNull()
+            ?.let { it.message ?: "打开终端失败" }
+
     override fun shutdown() = Unit
 
     private val MirrorRequest.sourceKindCode: Int

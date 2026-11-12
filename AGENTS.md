@@ -67,6 +67,8 @@ doc/                    长任务记忆与设计材料
 - 单 exe 由 `keelPlugin.executable` 产出：keel launcher + 内嵌 `keel-bundle.zip`，
   `.keel` 与 `resources/` 运行期只在内存打开，只有原生 DLL 物化到 `.cache/<id>/<version>/`。
   发布时只需一个 exe；工作目录按 `KEEL_HOME` → exe 目录 → 用户缓存目录回退。
+- 单 exe 用 `console = false`（Windows GUI 子系统），日志不写 stdout；需要看日志 / 敲命令时
+  由面板「打开终端」让内嵌的 `keel-plugin-console` 开窗口，或启动前设 `KEEL_CONSOLE=1`。
 - 没有自动化测试；验证靠 `nativeSmoke` / `keelRun` + 手动点「开始镜像」+ 帧率 / 画面尺寸读数。
 
 ## 3. 代码风格
