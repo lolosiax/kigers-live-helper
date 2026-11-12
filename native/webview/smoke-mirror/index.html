@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <title>klive mirror smoke</title>
+  <style>
+    html, body { margin: 0; height: 100%; background: #0e1014; color: #e7eaf0; }
+    body { font: 13px/1.6 Consolas, monospace; padding: 16px; box-sizing: border-box; }
+    h1 { font-size: 15px; color: #4a8fe7; margin: 0 0 12px; }
+    pre { margin: 0; white-space: pre-wrap; }
+  </style>
+</head>
+<body>
+<h1>klive mirror smoke</h1>
+<pre id="out">waiting...</pre>
+<script>
+  const out = document.getElementById('out');
+  const lines = [];
+  const pending = new Map();
+  let seq = 0;
+
+  function log(text) {
+    lines.push(text);
+    out.textContent = lines.join('\n');
+  }
+
+  window.chrome.webview.addEventListener('message', (event) => {
+    const message = event.data;
+    const resolve = pending.get(message.id);
+    if (resolve) {
+      pending.delete(message.id);
+      resolve(message);
+    }
+  });
+
+  function call(method, params) {
+    return new Promise((resolve) => {
+      const id = ++seq;
+      pending.set(id, resolve);
+      window.chrome.webview.postMessage(JSON.stringify({ id, method, params: params || {} }));
+    });
+  }
+
+  (async () => {
+    try {
+      const monitors = await call('enumerateMonitors');
+      const count = Array.isArray(monitors.result) ? monitors.result.length : 0;
+      if (count < 2) {
+        log('SMOKE_SKIP monitors=' + count);
+        return;
+      }
+
+      const start = await call('startMirror', {
+        windowHandle: '0',
+        sourceIndex: 0,
+        targetIndex: 1,
+        scaleMode: 0,
+        vsync: true,
+        captureBackend: 1,
+        sourceKind: 0,
+      });
+      log('SMOKE_START ' + JSON.stringify(start));
+
+      await new Promise((resolve) => setTimeout(resolve, 3000));
+
+      const stats = await call('getStats');
+      log('SMOKE_STATS ' + JSON.stringify(stats.result));
+
+      const stop = await call('stopMirror');
+      log('SMOKE_STOP ' + JSON.stringify(stop));
+    } catch (error) {
+      log('SMOKE_FAILED ' + error);
+    }
+  })();
+</script>
+</body>
+</html>

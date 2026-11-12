@@ -1,6 +1,7 @@
-# klive
+# Kiger's Live Helper（Kiger直播助手）
 
 把一台显示器的画面实时镜像到另一台显示器的 Windows 桌面工具。
+包名 `moe.lolosia.klive`、Gradle 工程名 `klive` 是缩写，产品名以本文件为准。
 
 首个 Demo 行为：控制面板里选择源显示器与目标显示器，点「开始镜像」，目标显示器会被一个
 无边框置顶窗口铺满，实时显示源显示器的画面。
@@ -10,9 +11,10 @@
 | 层 | 技术 | 位置 |
 | --- | --- | --- |
 | 采集 + 呈现核心 | C++ / D3D11（桌面复制 + WGC 两种采集后端） | `native/` |
-| 应用外壳 | Kotlin/JVM + Compose Desktop | `app/` |
-| 共享模型 | Kotlin Multiplatform（jvm + mingwX64 + linuxX64，无 Compose） | `core/` |
-| 桥接 | JNA 直连原生 C ABI | `app/src/main/kotlin/.../capture/` |
+| UI 外壳 | C++ / Win32 + WebView2（窗口、托盘、JSON 桥） | `native/webview/` |
+| 控制面板 | Compose Multiplatform（wasmJs，跑在 WebView2 里） | `ui/` |
+| 插件入口 | Kotlin/Native（keel 插件，负责物化资源与启动外壳） | `keel-plugin-klive/` |
+| 共享模型 | Kotlin Multiplatform（jvm + wasmJs + mingwX64 + linuxX64，无 Compose） | `core/` |
 
 采集源支持显示器与窗口，采集后端支持：
 
@@ -23,12 +25,12 @@
 
 两种后端都在 `native/src/frame_source.h` 里统一成 `FrameSource`，渲染与呈现逻辑共用。
 
-原生库只暴露 C ABI（[klive.h](native/include/klive.h)），JVM 外壳用 JNA 调用；
-将来若做 keel 插件（局域网 WebRTC/RTSP），同一份头文件可以直接给 Kotlin/Native cinterop 用。
+原生库只暴露 C ABI（[klive.h](native/include/klive.h)）；面板与原生之间是 WebView2 的
+`postMessage` + JSON 桥（[klive_webview.h](native/webview/klive_webview.h)）。
 
-`core` 与 `app` 拆开是必须的：Compose 编译器插件作用于整个 Gradle 工程，
+`core` / `ui` / `keel-plugin-klive` 拆开是必须的：Compose 编译器插件作用于整个 Gradle 工程，
 一旦工程里再声明 mingwX64 / linuxX64 目标就会因为缺少 Compose 运行时而编译失败。
-把纯 Kotlin 模型放在 `core`，才能既保证共享代码能编译到 keel 的目标上，又保住桌面 UI。
+把模型放 `core`、把 Compose 放 `ui`，keel 插件才能只依赖 `core`。
 
 渲染路径全程在 GPU 上：桌面复制拿到 `ID3D11Texture2D` → `CopyResource` 到自己的纹理 →
 D3D11 全屏四边形采样绘制 → flip 模型交换链 `Present`。CPU 不参与像素搬运。
@@ -45,32 +47,36 @@ native/             C++ 核心（CMake + MSVC）
     frame_source.h  FrameSource 抽象 + 帧中转纹理
     klive_duplication.cpp  桌面复制后端
     klive_wgc.cpp          WGC 后端（C++/WinRT）
-core/               共享模型：MonitorInfo / WindowInfo / CaptureBackend / MirrorRequest / MirrorStats
-app/                Compose Desktop 控制面板 + JNA 绑定
+  webview/          Win32 + WebView2 外壳、托盘、JSON 桥
+core/               共享模型 + MirrorEngine 端口
+ui/                 Compose Multiplatform 控制面板（wasmJs / jvm）
+keel-plugin-klive/  keel 插件：物化 DLL 与 wasm，拉起外壳
 ```
 
 ## 构建与运行
 
-要求：JDK 21、Visual Studio 2022（含 C++ 桌面工作负载）、CMake 3.20+。
+要求：JDK 21、Visual Studio 2022（含 C++ 桌面工作负载）、CMake 3.20+、WebView2 Runtime。
 
 ```powershell
-# 编译原生库（Release，输出 app/build/native/cmake/Release/klive_capture.dll）
-.\gradlew.bat :app:nativeBuild
+# 编译原生库（输出 native/build/cmake/Release/*.dll）
+.\gradlew.bat :native:nativeBuild
 
-# 启动控制面板（会自动先构建原生库）
-.\gradlew.bat :app:run
+# 打出插件包 -> keel-plugin-klive/build/keel/keel-plugin-klive-0.1.0.keel
+.\gradlew.bat :keel-plugin-klive:keelPackage
 
-# 不开窗，只枚举显示器，用于排查原生链路
-.\gradlew.bat :app:probe
+# 用 keel Host 加载插件并打开控制面板
+.\gradlew.bat :keel-plugin-klive:keelRun
 ```
 
-打包 MSI：`.\gradlew.bat :app:packageMsi`（DLL 会作为资源打进 jar，运行时解压到临时目录再加载）。
+只调面板布局时可以直接在浏览器里跑（Mock 引擎，不碰原生层）：
+`.\gradlew.bat :ui:wasmJsBrowserDevelopmentRun`。
 
 ## 使用
 
 1. 左侧选采集源：切「显示器」或「窗口」；显示器还可切「桌面复制 / WGC」后端。右侧选目标显示器（可切换等比填充 / 拉伸铺满、垂直同步）。
 2. 点「开始镜像」，目标显示器立即被镜像窗口覆盖。
 3. 退出镜像：`Ctrl + Alt + Q`；镜像窗口拿到焦点时按 `Esc` 也可以。
+4. 关闭面板只会缩到托盘；托盘菜单可以「显示面板 / 停止镜像 / 退出」。
 
 ## 限制
 
@@ -81,6 +87,5 @@ app/                Compose Desktop 控制面板 + JNA 绑定
 
 ## 后续方向
 
-- 把采集/呈现核心抽成 `core` 里的 expect/actual 实现，为 keel 插件复用做准备。
-- 局域网串流（WebRTC / RTSP），镜像核心复用同一套帧获取逻辑。
+- 局域网串流（WebRTC / RTSP），复用同一套帧获取逻辑。
 - 鼠标指针绘制、多路镜像、热插拔监听。

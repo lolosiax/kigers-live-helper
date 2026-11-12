@@ -9,3 +9,7 @@ out/
 *.log
 .DS_Store
 /cmake-build-*/
+
+# 工具 / 截图产物
+.screenshots/
+.trae-html-share-packages/

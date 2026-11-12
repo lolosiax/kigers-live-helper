@@ -8,55 +8,60 @@
 
 ## 0. 项目定位
 
-- **klive**：Windows 桌面屏幕镜像工具。把一台显示器（或一个窗口）的画面实时镜像到另一台显示器。
-- 包根 **`moe.lolosia.klive`**，Gradle 工程名 `klive`，版本 `0.1.0`。
-- 技术形态：**C++/D3D11 原生核心 + Kotlin/JVM 外壳**，二者只通过一份 C ABI 接触。
-  - `native/`：CMake + MSVC，产出 `klive_capture.dll`；
-  - `app/`：Kotlin/JVM + Compose Desktop 控制面板，用 JNA 调原生库；
-  - `core/`：纯 Kotlin 共享模型（KMP，jvm + mingwX64 + linuxX64，**不含 Compose**）。
-- 之所以拆 `core`：Compose 编译器插件作用于整个 Gradle 工程，工程里一旦有原生目标就会因缺
-  Compose Runtime 而编译失败。把模型放 `core`，才能既保住桌面 UI，又让共享代码能编译到
-  keel 的目标上。
+- **Kiger's Live Helper（Kiger直播助手）**：Windows 桌面屏幕镜像工具。把一台显示器（或一个窗口）的画面实时镜像到另一台显示器。
+- 包根 **`moe.lolosia.klive`**，Gradle 工程名 `klive`（`klive` 只是包名缩写，不是产品名），版本 `0.1.0`。
+- 技术形态：**C++/D3D11 原生核心 + keel 插件 + Compose wasmJs 面板**，Kotlin 侧只经 C ABI 接触原生。
+  - `native/`：CMake + MSVC，产出 `klive_capture.dll`（采集/呈现）与 `klive_webview.dll`（WebView2 外壳）；
+  - `keel-plugin-klive/`：K/N 薄插件，把 DLL 与 wasm 面板物化后拉起外壳；
+  - `ui/`：Compose Multiplatform 控制面板（wasmJs 供 WebView2，jvm 供本地调试）；
+  - `core/`：纯 Kotlin 共享模型与 `MirrorEngine` 端口（KMP，jvm + wasmJs + mingwX64 + linuxX64，**不含 Compose**）。
+- 之所以拆 `core` / `ui`：Compose 编译器插件作用于整个 Gradle 工程，工程里一旦有原生目标就会因缺
+  Compose Runtime 而编译失败。把模型放 `core`、把 Compose 放 `ui`，才能让 keel 插件只依赖 `core`。
 - 长期方向：镜像/串流核心将来要能被 **keel 插件**（局域网 WebRTC / RTSP）复用，
   所以原生层只暴露 C ABI、不暴露 C++ 类型。
 
 ## 1. 目录与构建边界
 
 ```
-native/     C++ 核心（独立 CMake 工程，不进 Gradle 的源码集）
-core/       KMP 共享模型（无 Compose、无平台 API）
-app/        Compose Desktop 外壳 + JNA 绑定 + 原生库构建任务
-doc/        长任务记忆与设计材料
+native/                 C++ 核心 + WebView2 外壳（独立 CMake 工程，不进 Gradle 的源码集）
+core/                   KMP 共享模型与 MirrorEngine 端口（无 Compose、无平台 API）
+ui/                     Compose Multiplatform 控制面板（jvm + wasmJs），桌面与 WebView2 共用
+keel-plugin-klive/      keel 插件（mingwX64），物化 DLL 与 wasm 后拉起 WebView2
+doc/                    长任务记忆与设计材料
 ```
 
-- 依赖方向**单向**：`app -> core`、`app -> native/src`（构建期 CMake，运行期 JNA）。
-  `core` 不得依赖 `app`，也不得引用任何 `java.*` / Compose / JNA 类型。
-- `native/` 不认识 Kotlin，`core/` 不认识 C++。跨层只走 [native/include/klive.h](native/include/klive.h)。
-- 原生库的构建任务写在 [app/build.gradle.kts](app/build.gradle.kts)（`nativeConfigure` /
-  `nativeBuild` / `copyNativeLib`），CMake 源码在 `native/`；不要另起一套构建入口。
+- 依赖方向**单向**：`ui -> core`、`keel-plugin-klive -> keel-api`（运行期加载原生 DLL）。
+  `core` 不得依赖 `ui` / `keel-plugin-klive`，也不得引用任何 `java.*` / Compose / JNA 类型。
+- `native/` 不认识 Kotlin，`core/` 不认识 C++。跨层只走 [native/include/klive.h](native/include/klive.h)
+  与 [native/webview/klive_webview.h](native/webview/klive_webview.h)。
+- 原生构建任务在 [native/build.gradle.kts](native/build.gradle.kts)（`nativeConfigure` /
+  `nativeBuild` / `nativeSmoke`），CMake 源码在 `native/`；不要另起一套构建入口。
 
 ## 2. 构建与验证
 
 ```powershell
-# 编译原生库（输出 app/build/native/cmake/Release/klive_capture.dll）
-.\gradlew.bat :app:nativeBuild
+# 编译原生库（输出 native/build/cmake/Release/klive_capture.dll + klive_webview.dll）
+.\gradlew.bat :native:nativeBuild
 
-# 启动控制面板（自动先构建原生库）
-.\gradlew.bat :app:run
+# 打出 .keel（原生 DLL + wasm 面板）
+.\gradlew.bat :keel-plugin-klive:keelPackage
 
-# 不开窗，只枚举显示器与窗口，用于排查原生链路
-.\gradlew.bat :app:probe
+# 用 keel Host 加载插件并打开 WebView2 面板（端到端自检）
+.\gradlew.bat :keel-plugin-klive:keelRun
 
-# 打包 MSI（DLL 作为资源打进 jar，运行时解压到临时目录再加载）
-.\gradlew.bat :app:packageMsi
+# WebView2 外壳冒烟：打开 smoke 页面，8 秒后自动退出
+.\gradlew.bat :native:nativeSmoke
+
+# 只在浏览器里调 wasm 面板（Mock 引擎，不碰原生层）
+.\gradlew.bat :ui:wasmJsBrowserDevelopmentRun
 ```
 
-- **改了任何代码至少跑**：`.\gradlew.bat :app:probe`（它会加载 DLL、枚举显示器与窗口，
-  JNA 结构体布局对不上时这里就会先炸）。
-- 只改 Kotlin 时可用 `.\gradlew.bat :app:compileKotlin` 快速校验；**但 Kotlin 侧的
-  `Klive*Struct` 改了必须跑 probe**，编译通过不等于 ABI 对齐。
-- 本机要求：JDK 21、Visual Studio 2022（含 C++ 桌面工作负载）、CMake 3.20+。
-- 没有自动化测试；验证靠 probe + 手动点「开始镜像」+ 帧率 / 画面尺寸读数。
+- **改了任何代码至少跑**：`.\gradlew.bat :keel-plugin-klive:keelRun`（物化 DLL、打开面板、
+  枚举显示器与窗口；ABI 或桥协议对不上时这里会先炸）。
+- 只改 Kotlin 时可用 `.\gradlew.bat :ui:compileKotlinWasmJs` 快速校验；**改了 C ABI 结构体必须
+  跑 `keelRun` 看枚举结果**，编译通过不等于两边布局一致。
+- 本机要求：JDK 21、Visual Studio 2022（含 C++ 桌面工作负载）、CMake 3.20+、WebView2 Runtime。
+- 没有自动化测试；验证靠 `nativeSmoke` / `keelRun` + 手动点「开始镜像」+ 帧率 / 画面尺寸读数。
 
 ## 3. 代码风格
 
@@ -83,13 +88,13 @@ doc/        长任务记忆与设计材料
    跨帧可变状态用 `mutableStateOf` + `by remember`，不要在 Composable 里攒普通 `var`。
 8. 展示用文案（中文）直接写在 Composable 里；原生层的错误文案在 C++ 里拼成 UTF-8
    （`klive_set_message`），Kotlin 只负责透传展示，不要两边各写一份。
-9. CLI 自检（`--probe`）可以直接 `println`；这是本项目唯一的「日志」出口，
-   不要为此引入日志框架。
+9. CLI 自检（`nativeSmoke`、`klive_webview_probe`）可以直接 `printf` / `println`；
+   keel 插件里的运行日志走 `Log.info(...)`，不要为此引入日志框架。
 
 ## 4. 跨语言边界（C ABI）
 
 [klive.h](native/include/klive.h) 是**唯一布局来源**：改 ABI 先改头文件，再同步
-`internal.h` / 实现 / Kotlin 侧 JNA 结构体，顺序不要反。
+`internal.h` / 实现 / `klive_webview.cpp` 里的 JSON 桥，顺序不要反。
 
 - **结构体布局必须两边一致**，且要经得起 JNA 的默认对齐：
   - 不放 4 字节以下的字段（`bool` / `short` 一律用 `int32_t`）；
@@ -97,11 +102,10 @@ doc/        长任务记忆与设计材料
   - 宽字段（`int64_t` / `double`）放在结构体开头，避免中间出现隐式 padding。
   - 当前尺寸（对方改了必须同步）：`klive_monitor_desc` = 292、`klive_window_desc` = 376、
     `klive_mirror_config` = 32、`klive_mirror_stats` = 32。
-- 字符串字段是**定长 `char[]` + UTF-8**，不是指针；Kotlin 侧用 `ByteArray(n)` + 去尾部 0 解码。
+- 字符串字段是**定长 `char[]` + UTF-8**，不是指针；桥里转成普通字符串。
 - 错误一律走「返回码 + `klive_last_message()`」：返回码给程序判断，message 给人看。
-  新增错误码要同时补 `MirrorEngine.errorText()`。
-- JNA 方法名与导出符号**必须完全一致**，所以 `KliveLibrary` 里的方法不能是 `internal`
-  （Kotlin 会给 internal 成员加名字修饰）。
+  新增错误码要同时补桥里的错误文案。
+- 64 位句柄（`handle`、`adapter_luid_*`）在 JSON 桥里用字符串传，避免 JS 数字精度问题。
 - 原生层只暴露 C 函数与 POD；C++ 类型（`ComPtr`、`winrt::*`）一律留在 `.cpp` / 内部头里。
 
 ## 5. 线程与并发
@@ -135,7 +139,7 @@ doc/        长任务记忆与设计材料
 
 - 提交前自检源码没被 `.gitignore` 误吞（`build/`、`.gradle/`、`*.log` 都在忽略列表里）。
 - **凭据、账号、服务器地址一律不入库**（含本文档与 `doc/`）；用占位符。
-- 不要提交 `app/build/**` 下的原生产物；DLL 由 `nativeBuild` 现编。
+- 不要提交 `native/build/**` 与 `keel-plugin-klive/build/**` 下的产物；DLL 与 `.keel` 由任务现编。
 - 一次提交只做一件事；信息用中文，主题行写「做了什么」，正文写「为什么」。
 
 ## 8. 文档
@@ -156,12 +160,17 @@ native/src/klive_mirror.cpp          镜像窗口 + 渲染循环 + 缩放 + Pres
 native/src/frame_source.h/.cpp       FrameSource 抽象、FrameCopy 中转纹理、DXGI 错误文案
 native/src/klive_duplication.cpp     桌面复制后端
 native/src/klive_wgc.cpp             WGC 后端（C++/WinRT，显示器 + 窗口）
-core/src/commonMain/.../model/MonitorInfo.kt   共享模型（见 §3.4 例外）
-app/src/main/kotlin/.../Main.kt                 入口；`--probe` 自检
-app/src/main/kotlin/.../capture/KliveLibrary.kt JNA 绑定 + 结构体 + DLL 加载
-app/src/main/kotlin/.../capture/MirrorEngine.kt 原生会话的薄封装（UI 只认这个）
-app/src/main/kotlin/.../ui/App.kt              控制面板（采集源 / 目标屏 / 选项 / 统计）
-app/src/main/kotlin/.../ui/theme/Theme.kt      深色控制台配色
+core/src/commonMain/.../model/MonitorInfo.kt          共享模型（见 §3.4 例外）
+core/src/commonMain/.../capture/MirrorEngine.kt       UI 依赖的镜像端口
+ui/src/commonMain/.../ui/App.kt                       控制面板（采集源 / 目标屏 / 选项 / 统计）
+ui/src/commonMain/.../ui/theme/Theme.kt               深色控制台配色 + 字体注入
+ui/src/wasmJsMain/.../ui/main.kt                      wasm 入口（ComposeViewport）
+ui/src/wasmJsMain/.../ui/bridge/Bridge.kt             postMessage 请求 / 回包
+ui/src/wasmJsMain/.../ui/engine/WasmMirrorEngine.kt   桥实现的 MirrorEngine
+native/webview/klive_webview.h                        WebView2 外壳 C ABI
+native/webview/klive_webview.cpp                      窗口 / 托盘 / 资源 / JSON 桥
+keel-plugin-klive/src/commonMain/resources/plugin.json  插件清单（id / 显示名 / 库路径）
+keel-plugin-klive/src/nativeMain/.../KlivePlugin.kt   插件生命周期：物化 + 启动外壳
 ```
 
 ## 10. 文档地图

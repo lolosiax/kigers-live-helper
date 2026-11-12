@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <title>klive WebView2 smoke</title>
+  <style>
+    html, body { margin: 0; height: 100%; background: #0e1014; color: #e7eaf0; }
+    body { font: 13px/1.6 Consolas, monospace; padding: 16px; box-sizing: border-box; }
+    h1 { font-size: 15px; color: #4a8fe7; margin: 0 0 12px; }
+    pre { margin: 0; white-space: pre-wrap; }
+  </style>
+</head>
+<body>
+<h1>klive WebView2 smoke</h1>
+<pre id="out">waiting...</pre>
+<script>
+  const out = document.getElementById('out');
+  const lines = [];
+  const pending = new Map();
+  let seq = 0;
+
+  function log(text) {
+    lines.push(text);
+    out.textContent = lines.join('\n');
+  }
+
+  window.chrome.webview.addEventListener('message', (event) => {
+    const message = event.data;
+    log('reply ' + message.id + ': ' + JSON.stringify(message).slice(0, 240));
+    const resolve = pending.get(message.id);
+    if (resolve) {
+      pending.delete(message.id);
+      resolve(message);
+    }
+  });
+
+  function call(method, params) {
+    return new Promise((resolve) => {
+      const id = ++seq;
+      pending.set(id, resolve);
+      window.chrome.webview.postMessage(JSON.stringify({ id, method, params: params || {} }));
+    });
+  }
+
+  (async () => {
+    try {
+      const monitors = await call('enumerateMonitors');
+      const windows = await call('enumerateWindows');
+      const stats = await call('getStats');
+      const message = await call('lastMessage');
+      log(
+        'SMOKE_DONE monitors=' + (Array.isArray(monitors.result) ? monitors.result.length : 'error') +
+        ' windows=' + (Array.isArray(windows.result) ? windows.result.length : 'error') +
+        ' running=' + (stats.result ? stats.result.running : 'error') +
+        ' message=' + JSON.stringify(message.result),
+      );
+    } catch (error) {
+      log('SMOKE_FAILED ' + error);
+    }
+  })();
+</script>
+</body>
+</html>

@@ -1,0 +1,15 @@
+{
+  "id": "klive",
+  "name": "KigerLiveHelper",
+  "color": "#4A8FE7",
+  "version": "0.1.0",
+  "abiVersion": 1,
+  "entry": "keel_plugin_worker_main",
+  "lib": {
+    "mingwX64": "lib/mingwX64/keel_plugin_klive.dll"
+  },
+  "resources": "resources/",
+  "requires": [],
+  "authors": ["lolosia"],
+  "description": "Kiger直播助手 · 显示器 / 窗口实时镜像"
+}

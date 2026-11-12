@@ -1,5 +1,7 @@
 pluginManagement {
     repositories {
+        // keel 的工具链插件只发布到本机 ~/.m2；必须排在远程仓库前面
+        mavenLocal()
         maven("https://maven.aliyun.com/repository/google") {
             mavenContent {
                 includeGroupAndSubgroups("androidx")
@@ -17,6 +19,7 @@ pluginManagement {
 
 dependencyResolutionManagement {
     repositories {
+        mavenLocal()
         maven("https://maven.aliyun.com/repository/public")
         // Compose Multiplatform 的桌面产物依赖 androidx.*（runtime-retain / savedstate / lifecycle）
         maven("https://maven.aliyun.com/repository/google") {
@@ -34,4 +37,6 @@ dependencyResolutionManagement {
 rootProject.name = "klive"
 
 include(":core")
-include(":app")
+include(":ui")
+include(":native")
+include(":keel-plugin-klive")
