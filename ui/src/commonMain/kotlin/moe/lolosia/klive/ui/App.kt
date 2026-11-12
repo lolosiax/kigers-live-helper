@@ -229,6 +229,7 @@ private fun Header(running: Boolean, onRefresh: () -> Unit) {
             Text(
                 "Kiger直播助手",
                 style = MaterialTheme.typography.titleLarge,
+                color = MaterialTheme.colorScheme.onBackground,
                 fontWeight = FontWeight.SemiBold,
             )
             Text(

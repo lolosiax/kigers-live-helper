@@ -82,6 +82,7 @@ target_link_libraries(klive_webview PRIVATE
     gdi32
     shell32
     shlwapi
+    dwmapi
     "${WEBVIEW2_DIR}/WebView2Loader.dll.lib"
 )
 

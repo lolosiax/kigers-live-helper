@@ -12,6 +12,18 @@ keelPlugin {
     target("mingwX64")
     buildType = "DEBUG"
     resources("build/generated/pluginResources")
+    // 单 exe：把本插件的 .keel 注入预编译 launcher，产物内嵌 bundle、运行时不落盘
+    executable {
+        enabled = true
+        name = "KigerLiveHelper"
+        // 上游目前只发布 debug launcher；release 包就绪后再切
+        buildType = "DEBUG"
+        windows {
+            productName = "Kiger's Live Helper"
+            fileDescription = "Kiger's Live Helper"
+            companyName = "lolosia"
+        }
+    }
     // 桥日志默认关闭（每秒多条，会把 keel 控制台刷满）；需要时加 -Pklive.bridgeLog
     if (providers.gradleProperty("klive.bridgeLog").isPresent) {
         runEnv("KLIVE_WEBVIEW_LOG", "1")

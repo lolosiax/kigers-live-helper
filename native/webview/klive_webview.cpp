@@ -14,6 +14,7 @@
 #include "klive_webview.h"
 
 #include <windows.h>
+#include <dwmapi.h>
 #include <shlobj.h>
 #include <shellapi.h>
 #include <shlwapi.h>
@@ -54,6 +55,9 @@ constexpr UINT kMenuExit = 3;
 constexpr int kIconResourceId = 101;
 constexpr const wchar_t* kWindowClass = L"KliveWebViewWindow";
 constexpr const wchar_t* kWindowTitle = L"Kiger\u76f4\u64ad\u52a9\u624b";
+// 深色标题栏：Windows 10 2004+ 用 20，1809-1909 用 19
+constexpr DWORD kDwmwaUseImmersiveDarkMode = 20;
+constexpr DWORD kDwmwaUseImmersiveDarkModeLegacy = 19;
 
 HINSTANCE ModuleHandle() {
     static HINSTANCE instance = [] {
@@ -997,6 +1001,12 @@ void UiThreadMain(UiContext* context) {
 
     SendMessageW(hwnd, WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(g_icon));
     SendMessageW(hwnd, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(g_icon));
+
+    // 标题栏跟随暗色面板：由 DWM 画白字，避免黑字压在深色背景上看不清
+    BOOL dark = TRUE;
+    if (FAILED(DwmSetWindowAttribute(hwnd, kDwmwaUseImmersiveDarkMode, &dark, sizeof(dark)))) {
+        DwmSetWindowAttribute(hwnd, kDwmwaUseImmersiveDarkModeLegacy, &dark, sizeof(dark));
+    }
 
     g_hwnd.store(hwnd);
     g_ui = context;

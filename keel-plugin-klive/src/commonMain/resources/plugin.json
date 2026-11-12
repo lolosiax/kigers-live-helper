@@ -1,6 +1,7 @@
 {
   "id": "klive",
-  "name": "KigerLiveHelper",
+  "name": "Kiger's Live Helper",
+  "logTag": "Kiger's Live",
   "color": "#4A8FE7",
   "version": "0.1.0",
   "abiVersion": 1,

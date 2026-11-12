@@ -64,9 +64,15 @@ keel-plugin-klive/  keel 插件：物化 DLL 与 wasm，拉起外壳
 # 打出插件包 -> keel-plugin-klive/build/keel/keel-plugin-klive-0.1.0.keel
 .\gradlew.bat :keel-plugin-klive:keelPackage
 
+# 打出单文件 exe -> keel-plugin-klive/build/keel/mingwX64/KigerLiveHelper.exe
+.\gradlew.bat :keel-plugin-klive:keelExecutableMingwX64
+
 # 用 keel Host 加载插件并打开控制面板
 .\gradlew.bat :keel-plugin-klive:keelRun
 ```
+
+单 exe 内嵌插件包与 wasm 面板，双击即可运行；首次运行会在 exe 同目录创建 `plugins/` 与
+`.cache/`（目录不可写时改用用户缓存目录）。目标机仍需安装 WebView2 Runtime。
 
 只调面板布局时可以直接在浏览器里跑（Mock 引擎，不碰原生层）：
 `.\gradlew.bat :ui:wasmJsBrowserDevelopmentRun`。

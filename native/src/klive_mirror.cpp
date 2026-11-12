@@ -245,7 +245,7 @@ int32_t run_mirror(KliveMirrorSession& session, const klive_mirror_config& confi
         return KLIVE_E_DEVICE;
     }
 
-    // 镜像窗口：无边框 + 置顶，直接铺满目标显示器
+    // 镜像窗口：无边框 + 置顶，直接铺满目标显示器；TOOLWINDOW 让它不进任务栏 / Alt+Tab
     HINSTANCE instance = GetModuleHandleW(nullptr);
     if (!register_window_class(instance)) {
         klive_set_message("注册镜像窗口类失败");
@@ -256,8 +256,9 @@ int32_t run_mirror(KliveMirrorSession& session, const klive_mirror_config& confi
     const int window_width = rect.right - rect.left;
     const int window_height = rect.bottom - rect.top;
 
-    HWND hwnd = CreateWindowExW(WS_EX_TOPMOST, kWindowClass, L"klive", WS_POPUP, rect.left, rect.top,
-                                window_width, window_height, nullptr, nullptr, instance, nullptr);
+    HWND hwnd = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW, kWindowClass, L"klive", WS_POPUP,
+                                rect.left, rect.top, window_width, window_height, nullptr, nullptr,
+                                instance, nullptr);
     if (hwnd == nullptr) {
         klive_set_message("创建镜像窗口失败（错误码 %lu）", static_cast<unsigned long>(GetLastError()));
         return KLIVE_E_WINDOW;

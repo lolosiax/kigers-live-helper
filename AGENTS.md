@@ -46,6 +46,9 @@ doc/                    长任务记忆与设计材料
 # 打出 .keel（原生 DLL + wasm 面板）
 .\gradlew.bat :keel-plugin-klive:keelPackage
 
+# 打出内嵌 bundle 的单文件 exe（webview 与 wasm 面板都在里面）
+.\gradlew.bat :keel-plugin-klive:keelExecutableMingwX64
+
 # 用 keel Host 加载插件并打开 WebView2 面板（端到端自检）
 .\gradlew.bat :keel-plugin-klive:keelRun
 
@@ -61,6 +64,9 @@ doc/                    长任务记忆与设计材料
 - 只改 Kotlin 时可用 `.\gradlew.bat :ui:compileKotlinWasmJs` 快速校验；**改了 C ABI 结构体必须
   跑 `keelRun` 看枚举结果**，编译通过不等于两边布局一致。
 - 本机要求：JDK 21、Visual Studio 2022（含 C++ 桌面工作负载）、CMake 3.20+、WebView2 Runtime。
+- 单 exe 由 `keelPlugin.executable` 产出：keel launcher + 内嵌 `keel-bundle.zip`，
+  `.keel` 与 `resources/` 运行期只在内存打开，只有原生 DLL 物化到 `.cache/<id>/<version>/`。
+  发布时只需一个 exe；工作目录按 `KEEL_HOME` → exe 目录 → 用户缓存目录回退。
 - 没有自动化测试；验证靠 `nativeSmoke` / `keelRun` + 手动点「开始镜像」+ 帧率 / 画面尺寸读数。
 
 ## 3. 代码风格
