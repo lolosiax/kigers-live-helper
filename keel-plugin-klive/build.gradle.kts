@@ -10,6 +10,7 @@ keelPlugin {
     // keel 工件目前只有 0.1.0-SNAPSHOT；KSP / Host 都按这个版本解析
     keelVersion = libs.versions.keel.get()
     target("mingwX64")
+    // keelRun / keelPackage 仍用 debug，保留断点与符号
     buildType = "DEBUG"
     resources("build/generated/pluginResources")
     // 单 exe：把本插件的 .keel 注入预编译 launcher，产物内嵌 bundle、运行时不落盘
@@ -18,8 +19,11 @@ keelPlugin {
         name = "KigerLiveHelper"
         // 桌面应用：GUI 子系统，双击不弹控制台；日志与命令走「打开终端」的 console 插件
         console = false
-        // 上游目前只发布 debug launcher；release 包就绪后再切
-        buildType = "DEBUG"
+        // 出包用 release：插件走 keelPackageRelease，launcher 走 keel-launcher-<target>
+        buildType = "RELEASE"
+        // bundle 单帧 zstd（-19）；解码器在 Host 的 keel-abi 里
+        compression = "zstd"
+        compressionLevel = 19
         include("moe.lolosia.keel.plugins:keel-plugin-console:${libs.versions.keel.get()}@keel")
         windows {
             productName = "Kiger's Live Helper"
