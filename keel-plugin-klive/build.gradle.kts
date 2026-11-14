@@ -85,6 +85,6 @@ val copyWeb by tasks.registering(Sync::class) {
     into(layout.buildDirectory.dir("generated/pluginResources/web"))
 }
 
-tasks.named("keelPackage") {
+tasks.matching { it.name == "keelPackage" || it.name == "keelPackageRelease" }.configureEach {
     dependsOn(copyNative, copyWeb)
 }
