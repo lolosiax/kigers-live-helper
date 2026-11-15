@@ -63,6 +63,7 @@ class WasmMirrorEngine(private val bridge: Bridge) : MirrorEngine {
             put("vsync", request.vsync)
             put("captureBackend", request.backend.code)
             put("sourceKind", request.sourceKindCode)
+            put("mode", request.mode.code)
         }
         return runCatching { bridge.call("startMirror", params) }
             .exceptionOrNull()
@@ -83,7 +84,31 @@ class WasmMirrorEngine(private val bridge: Bridge) : MirrorEngine {
             frameWidth = dto.frameWidth,
             frameHeight = dto.frameHeight,
             lastError = dto.lastError,
+            mode = MirrorMode.fromCode(dto.mode),
+            sourceIndex = dto.sourceIndex,
         )
+    }
+
+    override suspend fun settings(): MirrorSettings? = runCatching {
+        val result = bridge.call("getSettings").jsonObject
+        MirrorSettings(
+            mode = MirrorMode.fromCode(result["mode"]?.jsonPrimitive?.intOrNull ?: 0),
+            sourceIndex = result["sourceIndex"]?.jsonPrimitive?.intOrNull?.takeIf { it >= 0 },
+            targetIndex = result["targetIndex"]?.jsonPrimitive?.intOrNull?.takeIf { it >= 0 },
+        )
+    }.getOrNull()
+
+    override suspend fun saveSettings(settings: MirrorSettings) {
+        runCatching {
+            bridge.call(
+                "saveSettings",
+                buildJsonObject {
+                    put("mode", settings.mode.code)
+                    put("sourceIndex", settings.sourceIndex ?: -1)
+                    put("targetIndex", settings.targetIndex ?: -1)
+                },
+            )
+        }
     }
 
     override suspend fun lastMessage(): String? {

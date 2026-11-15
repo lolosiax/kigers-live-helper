@@ -39,4 +39,6 @@ internal data class StatsDto(
     val frameWidth: Int = 0,
     val frameHeight: Int = 0,
     val lastError: Int = 0,
+    val mode: Int = 0,
+    val sourceIndex: Int = -1,
 )

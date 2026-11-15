@@ -70,6 +70,19 @@ int32_t klive_is_running(void) {
     return klive_session().running.load() ? 1 : 0;
 }
 
+int32_t klive_set_mode(int32_t mode) {
+    if (mode < 0 || mode >= KLIVE_MODE_COUNT) {
+        klive_set_message("镜像档位无效");
+        return KLIVE_E_INVALID_ARG;
+    }
+    klive_session().mode = mode;
+    return KLIVE_OK;
+}
+
+int32_t klive_get_mode(void) {
+    return klive_session().mode.load();
+}
+
 int32_t klive_get_stats(klive_mirror_stats* out) {
     if (out == nullptr) return KLIVE_E_INVALID_ARG;
     KliveMirrorSession& session = klive_session();
@@ -79,6 +92,8 @@ int32_t klive_get_stats(klive_mirror_stats* out) {
     out->frame_height = session.frame_height.load();
     out->running = session.running.load() ? 1 : 0;
     out->last_error = session.last_error.load();
+    out->mode = session.mode.load();
+    out->source_index = session.source_index.load();
     return KLIVE_OK;
 }
 

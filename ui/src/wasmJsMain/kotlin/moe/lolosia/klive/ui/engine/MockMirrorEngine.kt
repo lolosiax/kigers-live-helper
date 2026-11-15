@@ -10,6 +10,9 @@ class MockMirrorEngine : MirrorEngine {
 
     private var running = false
     private var frames = 0L
+    private var mode = MirrorMode.Fullscreen
+    private var sourceIndex: Int? = 0
+    private var targetIndex: Int? = 1
 
     private val sampleMonitors = listOf(
         MonitorInfo(
@@ -70,6 +73,9 @@ class MockMirrorEngine : MirrorEngine {
     override suspend fun start(request: MirrorRequest): String? {
         running = true
         frames = 0
+        mode = request.mode
+        sourceIndex = request.sourceIndex
+        targetIndex = request.targetIndex
         return null
     }
 
@@ -86,10 +92,21 @@ class MockMirrorEngine : MirrorEngine {
             frameWidth = if (running) 2560 else 0,
             frameHeight = if (running) 1440 else 0,
             lastError = 0,
+            mode = mode,
+            sourceIndex = if (mode == MirrorMode.Fullscreen) sourceIndex ?: -1 else 0,
         )
     }
 
     override suspend fun lastMessage(): String? = null
+
+    override suspend fun settings(): MirrorSettings =
+        MirrorSettings(mode = mode, sourceIndex = sourceIndex, targetIndex = targetIndex)
+
+    override suspend fun saveSettings(settings: MirrorSettings) {
+        mode = settings.mode
+        sourceIndex = settings.sourceIndex ?: sourceIndex
+        targetIndex = settings.targetIndex ?: targetIndex
+    }
 
     override suspend fun openConsole(): String? = null
 

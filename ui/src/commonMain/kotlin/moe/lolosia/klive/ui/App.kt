@@ -47,7 +47,9 @@ import kotlinx.coroutines.launch
 import moe.lolosia.klive.capture.MirrorEngine
 import moe.lolosia.klive.model.CaptureBackend
 import moe.lolosia.klive.model.CaptureSourceKind
+import moe.lolosia.klive.model.MirrorMode
 import moe.lolosia.klive.model.MirrorRequest
+import moe.lolosia.klive.model.MirrorSettings
 import moe.lolosia.klive.model.MirrorStats
 import moe.lolosia.klive.model.MonitorInfo
 import moe.lolosia.klive.model.ScaleMode
@@ -66,9 +68,11 @@ fun App(engine: MirrorEngine) {
     var windowHandle by remember { mutableStateOf<Long?>(null) }
     var scaleMode by remember { mutableStateOf(ScaleMode.Fit) }
     var vsync by remember { mutableStateOf(true) }
+    var mode by remember { mutableStateOf(MirrorMode.Fullscreen) }
     var running by remember { mutableStateOf(false) }
     var stats by remember { mutableStateOf(MirrorStats.Idle) }
     var message by remember { mutableStateOf<String?>(null) }
+    var settingsReady by remember { mutableStateOf(false) }
 
     val scope = rememberCoroutineScope()
 
@@ -97,7 +101,26 @@ fun App(engine: MirrorEngine) {
             .onFailure { if (loadError == null) loadError = it.message ?: "枚举窗口失败" }
     }
 
-    LaunchedEffect(Unit) { refresh() }
+    LaunchedEffect(Unit) {
+        refresh()
+        // 先把上次的选择贴回枚举结果，再允许回写，避免启动时用默认值覆盖配置
+        val saved = runCatching { engine.settings() }.getOrNull()
+        if (saved != null) {
+            val indices = monitors.map { it.index }
+            mode = saved.mode
+            saved.sourceIndex?.takeIf { it in indices }?.let { sourceIndex = it }
+            saved.targetIndex?.takeIf { it in indices }?.let { targetIndex = it }
+            if (sourceIndex == targetIndex) {
+                targetIndex = indices.firstOrNull { it != sourceIndex } ?: targetIndex
+            }
+        }
+        settingsReady = true
+    }
+
+    LaunchedEffect(settingsReady, mode, sourceIndex, targetIndex) {
+        if (!settingsReady) return@LaunchedEffect
+        engine.saveSettings(MirrorSettings(mode, sourceIndex, targetIndex))
+    }
 
     LaunchedEffect(Unit) {
         while (true) {
@@ -107,6 +130,9 @@ fun App(engine: MirrorEngine) {
                     if (!current.running) {
                         running = false
                         message = engine.lastMessage()
+                    } else if (current.mode != mode) {
+                        // 侧键在原生层切了档，面板跟上
+                        mode = current.mode
                     }
                 }
             }
@@ -116,9 +142,11 @@ fun App(engine: MirrorEngine) {
 
     val source = sourceIndex
     val target = targetIndex
-    val canStart = !running && target != null && when (sourceKind) {
-        CaptureSourceKind.Monitor -> source != null && source != target
-        CaptureSourceKind.Window -> windowHandle != null
+    val canStart = !running && target != null && when {
+        // 动态档位只需要一块「不是目标屏」的显示器
+        mode != MirrorMode.Fullscreen -> monitors.any { it.index != target }
+        sourceKind == CaptureSourceKind.Monitor -> source != null && source != target
+        else -> windowHandle != null
     }
 
     Column(
@@ -134,7 +162,9 @@ fun App(engine: MirrorEngine) {
                 }
             },
         )
-        Spacer(Modifier.height(20.dp))
+        Spacer(Modifier.height(16.dp))
+        ModeBar(mode = mode, onSelect = { mode = it })
+        Spacer(Modifier.height(16.dp))
 
         Row(modifier = Modifier.weight(1f).fillMaxWidth()) {
             SourcePanel(
@@ -182,8 +212,11 @@ fun App(engine: MirrorEngine) {
             running = running,
             canStart = canStart,
             hint = when {
-                sourceKind == CaptureSourceKind.Monitor && monitors.size < 2 -> "至少需要两台显示器"
-                sourceKind == CaptureSourceKind.Window && windows.isEmpty() -> "没有找到可采集窗口"
+                mode != MirrorMode.Fullscreen && monitors.size < 2 -> "至少需要两台显示器"
+                mode == MirrorMode.Fullscreen && sourceKind == CaptureSourceKind.Monitor &&
+                    monitors.size < 2 -> "至少需要两台显示器"
+                mode == MirrorMode.Fullscreen && sourceKind == CaptureSourceKind.Window &&
+                    windows.isEmpty() -> "没有找到可采集窗口"
                 else -> null
             },
             onStart = {
@@ -195,6 +228,7 @@ fun App(engine: MirrorEngine) {
                             scaleMode = scaleMode,
                             vsync = vsync,
                             backend = backend,
+                            mode = mode,
                         )
                         CaptureSourceKind.Window -> MirrorRequest(
                             sourceIndex = 0,
@@ -202,6 +236,7 @@ fun App(engine: MirrorEngine) {
                             scaleMode = scaleMode,
                             vsync = vsync,
                             windowHandle = windowHandle ?: 0L,
+                            mode = mode,
                         )
                     }
                     val error = engine.start(request)
@@ -268,6 +303,30 @@ private fun StatusPill(running: Boolean) {
         Box(Modifier.size(7.dp).clip(CircleShape).background(color))
         Spacer(Modifier.width(7.dp))
         Text(if (running) "正在镜像" else "空闲", style = MaterialTheme.typography.labelMedium, color = color)
+    }
+}
+
+@Composable
+private fun ModeBar(mode: MirrorMode, onSelect: (MirrorMode) -> Unit) {
+    Column {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                "镜像档位",
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Spacer(Modifier.width(10.dp))
+            MirrorMode.entries.forEach { item ->
+                ModeChip(item.label, item == mode) { onSelect(item) }
+                Spacer(Modifier.width(8.dp))
+            }
+        }
+        Spacer(Modifier.height(6.dp))
+        Text(
+            "${mode.description} · 侧键：后退键上一档 / 前进键下一档",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
     }
 }
 

@@ -60,6 +60,33 @@ enum class CaptureSourceKind(val code: Int) {
     Window(1),
 }
 
+/**
+ * 镜像档位，与原生层 KLIVE_MODE_* 对应。
+ *
+ * 除 [Fullscreen] 外都由原生层按鼠标 / 前台窗口实时解析采集源；
+ * 缩放档位同样跟随鼠标所在显示器，并排除目标显示器。
+ */
+enum class MirrorMode(val code: Int, val label: String, val description: String) {
+    Fullscreen(0, "全屏镜像", "镜像左侧选中的显示器或窗口"),
+    PointerMonitor(1, "跟随鼠标屏幕", "实时镜像鼠标所在显示器，排除目标屏"),
+    PointerWindow(2, "鼠标下窗口", "镜像鼠标下方最上层的窗口"),
+    FocusWindow(3, "前台窗口", "镜像当前前台窗口"),
+    Zoom2x(4, "2× 缩放", "以鼠标为中心放大鼠标所在显示器"),
+    Zoom3x(5, "3× 缩放", "以鼠标为中心放大鼠标所在显示器"),
+    Zoom4x(6, "4× 缩放", "以鼠标为中心放大鼠标所在显示器");
+
+    companion object {
+        fun fromCode(code: Int): MirrorMode = entries.firstOrNull { it.code == code } ?: Fullscreen
+    }
+}
+
+/** 持久化在插件配置里的镜像设置；显示器用 index 表示，原生层负责映射到稳定身份。 */
+data class MirrorSettings(
+    val mode: MirrorMode = MirrorMode.Fullscreen,
+    val sourceIndex: Int? = null,
+    val targetIndex: Int? = null,
+)
+
 /** 一个可采集的顶层窗口，由原生层 klive_window_desc 转换而来。 */
 data class WindowInfo(
     val handle: Long,
@@ -84,6 +111,7 @@ data class MirrorRequest(
     val vsync: Boolean = true,
     val backend: CaptureBackend = CaptureBackend.DesktopDuplication,
     val windowHandle: Long = 0L,
+    val mode: MirrorMode = MirrorMode.Fullscreen,
 )
 
 data class MirrorStats(
@@ -93,6 +121,8 @@ data class MirrorStats(
     val frameWidth: Int,
     val frameHeight: Int,
     val lastError: Int,
+    val mode: MirrorMode = MirrorMode.Fullscreen,
+    val sourceIndex: Int = -1,
 ) {
     companion object {
         val Idle = MirrorStats(

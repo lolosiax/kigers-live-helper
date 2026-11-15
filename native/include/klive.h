@@ -59,6 +59,21 @@ enum {
 };
 
 /*
+ * 镜像档位。0 为固定采集源，1 起由鼠标 / 前台窗口动态决定源。
+ * 缩放档位同样跟随鼠标所在显示器，并排除目标显示器。
+ */
+enum {
+    KLIVE_MODE_FULLSCREEN = 0,
+    KLIVE_MODE_POINTER_MONITOR = 1,
+    KLIVE_MODE_POINTER_WINDOW = 2,
+    KLIVE_MODE_FOCUS_WINDOW = 3,
+    KLIVE_MODE_ZOOM_2X = 4,
+    KLIVE_MODE_ZOOM_3X = 5,
+    KLIVE_MODE_ZOOM_4X = 6,
+    KLIVE_MODE_COUNT = 7,
+};
+
+/*
  * 一台显示器。
  * 坐标是物理像素（进程在 klive_initialize 里被设为 per-monitor DPI aware）。
  * 布局与 Kotlin 侧 KliveMonitorStruct 一一对应，改动时两边同步。
@@ -101,6 +116,8 @@ typedef struct klive_mirror_config {
     int32_t vsync;           /* 1 = Present 垂直同步 */
     int32_t capture_backend; /* KLIVE_CAPTURE_* */
     int32_t source_kind;     /* KLIVE_SOURCE_*，窗口采集只支持 WGC */
+    int32_t mode;            /* KLIVE_MODE_*，非 0 档忽略 source_index / window_handle */
+    int32_t reserved;        /* 补齐到 8 的整数倍 */
 } klive_mirror_config;
 
 typedef struct klive_mirror_stats {
@@ -110,6 +127,8 @@ typedef struct klive_mirror_stats {
     int32_t frame_height;
     int32_t running;
     int32_t last_error;
+    int32_t mode;            /* 当前档位 KLIVE_MODE_* */
+    int32_t source_index;    /* 当前实际源显示器；窗口源或未解析时为 -1 */
 } klive_mirror_stats;
 
 /* 进程级初始化（DPI 感知）。可重复调用。 */
@@ -128,6 +147,14 @@ KLIVE_API int32_t klive_start_mirror(const klive_mirror_config* config);
 KLIVE_API int32_t klive_stop_mirror(void);
 
 KLIVE_API int32_t klive_is_running(void);
+
+/*
+ * 切换镜像档位；运行中立即生效，未运行时作为下一次启动的默认值。
+ * 档位非法返回 KLIVE_E_INVALID_ARG。
+ */
+KLIVE_API int32_t klive_set_mode(int32_t mode);
+
+KLIVE_API int32_t klive_get_mode(void);
 
 KLIVE_API int32_t klive_get_stats(klive_mirror_stats* out);
 

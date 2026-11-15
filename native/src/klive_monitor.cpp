@@ -48,22 +48,15 @@ struct WindowEnumContext {
 
 BOOL CALLBACK enum_window_proc(HWND hwnd, LPARAM param) {
     auto* context = reinterpret_cast<WindowEnumContext*>(param);
-
-    if (!IsWindowVisible(hwnd)) return TRUE;
-    if (GetWindowTextLengthW(hwnd) <= 0) return TRUE;
-    if ((GetWindowLongPtrW(hwnd, GWL_EXSTYLE) & WS_EX_TOOLWINDOW) != 0) return TRUE;
+    if (!klive_is_capturable_window(hwnd)) return TRUE;
 
     DWORD pid = 0;
     GetWindowThreadProcessId(hwnd, &pid);
-    // 自己（控制面板 / 镜像窗口）不进列表
-    if (pid == GetCurrentProcessId()) return TRUE;
-    if (is_cloaked(hwnd)) return TRUE;
 
     RECT rect{};
-    if (!GetWindowRect(hwnd, &rect)) return TRUE;
+    GetWindowRect(hwnd, &rect);
     const int width = rect.right - rect.left;
     const int height = rect.bottom - rect.top;
-    if (width <= 0 || height <= 0) return TRUE;
 
     klive_window_desc desc{};
     desc.handle = static_cast<int64_t>(reinterpret_cast<intptr_t>(hwnd));
@@ -86,6 +79,23 @@ BOOL CALLBACK enum_window_proc(HWND hwnd, LPARAM param) {
 }
 
 }  // namespace
+
+bool klive_is_capturable_window(HWND window) {
+    if (window == nullptr || !IsWindow(window)) return false;
+    if (!IsWindowVisible(window)) return false;
+    if (GetWindowTextLengthW(window) <= 0) return false;
+    if ((GetWindowLongPtrW(window, GWL_EXSTYLE) & WS_EX_TOOLWINDOW) != 0) return false;
+
+    DWORD pid = 0;
+    GetWindowThreadProcessId(window, &pid);
+    // 自己（控制面板 / 镜像窗口 / console 插件窗口）不进列表，也不能作为动态采集源
+    if (pid == GetCurrentProcessId()) return false;
+    if (is_cloaked(window)) return false;
+
+    RECT rect{};
+    if (!GetWindowRect(window, &rect)) return false;
+    return rect.right > rect.left && rect.bottom > rect.top;
+}
 
 void klive_set_message(const char* fmt, ...) {
     SrwExclusiveLock lock(g_message_lock);

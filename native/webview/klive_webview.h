@@ -50,6 +50,17 @@ typedef struct klive_webview_config {
      */
     void (*open_console)(void* user_data);
     void* open_console_user;
+    /*
+     * 持久化设置（UTF-8 JSON，可空）：档位 + 全屏档的源 / 目标显示器身份。
+     * 键：mode / sourceMonitor / sourceFriendly / targetMonitor / targetFriendly。
+     */
+    const char* settings_json;
+    /*
+     * 设置变更回调，可空。native 在 UI 线程调用，参数是完整 JSON；
+     * 实现同样只能投递消息，不能阻塞（切档走的是低级鼠标钩子）。
+     */
+    void (*save_settings)(const char* json, void* user_data);
+    void* save_settings_user;
 } klive_webview_config;
 
 /*

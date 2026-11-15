@@ -37,7 +37,12 @@ internal class WebViewShell private constructor(
 ) {
 
     /** 启动外壳；返回 0 表示窗口与 WebView2 已经就绪。 */
-    fun start(nativeDir: String, webDir: String, devtools: Boolean): Int = memScoped {
+    fun start(
+        nativeDir: String,
+        webDir: String,
+        devtools: Boolean,
+        settingsJson: String,
+    ): Int = memScoped {
         val config = alloc<klive_webview_config>()
         config.native_dir = nativeDir.cstr.ptr
         config.web_dir = webDir.cstr.ptr
@@ -50,6 +55,9 @@ internal class WebViewShell private constructor(
         config.reserved = 0
         config.open_console = staticCFunction(::notifyOpenConsole)
         config.open_console_user = null
+        config.settings_json = settingsJson.cstr.ptr
+        config.save_settings = staticCFunction(::notifySaveSettings)
+        config.save_settings_user = null
         startFn(config.ptr)
     }
 
@@ -103,4 +111,12 @@ internal class WebViewShell private constructor(
 /** WebView2 UI 线程点击「打开终端」时进入插件运行时；实现只投递消息，不能抛异常。 */
 private fun notifyOpenConsole(@Suppress("UNUSED_PARAMETER") user: COpaquePointer?) {
     WebConsole.open()
+}
+
+/** 原生切档 / 改选后回调；只把 JSON 投回 Worker 线程，不能在这里读写配置。 */
+private fun notifySaveSettings(
+    json: CPointer<ByteVar>?,
+    @Suppress("UNUSED_PARAMETER") user: COpaquePointer?,
+) {
+    MirrorSettingsBridge.post(json?.toKString().orEmpty())
 }

@@ -53,12 +53,17 @@ struct KliveMirrorSession {
     std::atomic<double> fps{0.0};
     std::atomic<int32_t> frame_width{0};
     std::atomic<int32_t> frame_height{0};
+    std::atomic<int32_t> mode{KLIVE_MODE_FULLSCREEN};
+    std::atomic<int32_t> source_index{-1};
     klive_mirror_config config{};
 };
 
 std::vector<KliveOutput> klive_collect_outputs();
 
 std::vector<klive_window_desc> klive_collect_windows();
+
+/* 窗口是否可以作为采集源：可见、有标题、非工具窗、非本进程、未被 DWM cloak、尺寸有效。 */
+bool klive_is_capturable_window(HWND window);
 
 KliveMirrorSession& klive_session();
 

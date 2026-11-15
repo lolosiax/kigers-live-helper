@@ -1,5 +1,6 @@
 plugins {
     alias(libs.plugins.kotlinMultiplatform)
+    alias(libs.plugins.kotlinSerialization)
     id("moe.lolosia.keel.plugin") version "0.1.0-SNAPSHOT"
 }
 
@@ -60,6 +61,9 @@ kotlin {
         }
         commonMain.dependencies {
             api(libs.keel.api)
+        }
+        nativeMain.dependencies {
+            implementation(libs.kotlinx.serialization.json)
         }
     }
 }

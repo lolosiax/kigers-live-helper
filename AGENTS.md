@@ -86,7 +86,8 @@ doc/                    长任务记忆与设计材料
 4. **一个 `.kt` 只放一个顶层类型**（class / object / interface / enum），嵌套类随宿主保留。
    - 当前唯一例外：[MonitorInfo.kt](core/src/commonMain/kotlin/moe/lolosia/klive/model/MonitorInfo.kt)
      集中放共享模型（`MonitorInfo` / `WindowInfo` / `CaptureBackend` / `CaptureSourceKind` /
-     `ScaleMode` / `MirrorRequest` / `MirrorStats`）。这些类型体量都很小、总是一起用；
+     `ScaleMode` / `MirrorMode` / `MirrorRequest` / `MirrorSettings` / `MirrorStats`）。
+     这些类型体量都很小、总是一起用；
      某个类型长出行为或依赖时再单独拆文件。
    - `private` 顶层声明不受此限：单行常量、只服务本文件的辅助函数，就近放使用处。
 5. **散装函数 / 常量放同包 `package.kt`**；Kotlin 侧目前没有，需要时按此约定新建。
@@ -109,10 +110,16 @@ doc/                    长任务记忆与设计材料
   - **总大小保持 8 的整数倍**，必要时用 `int32_t reserved` 补齐；
   - 宽字段（`int64_t` / `double`）放在结构体开头，避免中间出现隐式 padding。
   - 当前尺寸（对方改了必须同步）：`klive_monitor_desc` = 292、`klive_window_desc` = 376、
-    `klive_mirror_config` = 32、`klive_mirror_stats` = 32。
+    `klive_mirror_config` = 40、`klive_mirror_stats` = 40。
+  - `klive_webview_config` 尾部追加了 `settings_json` / `save_settings` / `save_settings_user`；
+    这是破坏性变更，改完必须重编原生 DLL、keel 插件与 `klive_webview_smoke`。
+- 持久化设置属于用户数据，落盘在 `%LOCALAPPDATA%\klive\settings.json`；
+  keel 插件配置只做镜像 / 首次迁移种子，不能作为唯一来源（`keelRun` 会清空运行目录）。
 - 字符串字段是**定长 `char[]` + UTF-8**，不是指针；桥里转成普通字符串。
 - 错误一律走「返回码 + `klive_last_message()`」：返回码给程序判断，message 给人看。
   新增错误码要同时补桥里的错误文案。
+- 镜像档位（`KLIVE_MODE_*`）由原生采集层实时解析源；`mode != KLIVE_MODE_FULLSCREEN`
+  时 `source_index` / `window_handle` 只是解析失败时的回退值，不能当作当前源。
 - 64 位句柄（`handle`、`adapter_luid_*`）在 JSON 桥里用字符串传，避免 JS 数字精度问题。
 - 原生层只暴露 C 函数与 POD；C++ 类型（`ComPtr`、`winrt::*`）一律留在 `.cpp` / 内部头里。
 
@@ -138,6 +145,11 @@ doc/                    长任务记忆与设计材料
   纹理再画（`FrameCopy`）。不要在渲染路径上直接持有帧池纹理。
 - 设备建在**源显示器所属显卡**上；跨显卡呈现交给 DWM 合成（已验证可用）。
   窗口采集时设备建在目标显示器所在显卡上。
+- 动态档位（跟随鼠标 / 窗口 / 缩放）每 250ms 重新解析源：同卡只换 `FrameSource`，
+  跨卡才重建 device / swapchain，镜像窗口本身不重建。
+- 换卡重建时必须**先释放旧视图 / 交换链，再 `ClearState` + `Flush`**，最后才
+  `CreateSwapChainForHwnd`：一个 HWND 同时只能挂一个 flip 交换链，D3D11 的延迟销毁
+  会让顺序反过来的重建报 `E_ACCESSDENIED`。
 - 全屏四边形的固定要求（回退就会黑屏）：`D3D11_CULL_NONE` 光栅化状态 + 显式 `viewport` +
   flip 模型交换链（`DXGI_SWAP_EFFECT_FLIP_DISCARD`）。
 - 采集失败要有可读原因：`klive_set_dxgi_error` 已覆盖常见的 `DXGI_ERROR_*`，
@@ -178,7 +190,9 @@ ui/src/wasmJsMain/.../ui/engine/WasmMirrorEngine.kt   桥实现的 MirrorEngine
 native/webview/klive_webview.h                        WebView2 外壳 C ABI
 native/webview/klive_webview.cpp                      窗口 / 托盘 / 资源 / JSON 桥
 keel-plugin-klive/src/commonMain/resources/plugin.json  插件清单（id / 显示名 / 库路径）
-keel-plugin-klive/src/nativeMain/.../KlivePlugin.kt   插件生命周期：物化 + 启动外壳
+keel-plugin-klive/src/nativeMain/.../KlivePlugin.kt   插件生命周期：物化 + 启动外壳 + 配置读写
+keel-plugin-klive/src/nativeMain/.../MirrorSettings.kt  持久化的档位 / 显示器身份
+keel-plugin-klive/src/nativeMain/.../MirrorSettingsBridge.kt 原生回调 → 事件泵投递口
 ```
 
 ## 10. 文档地图

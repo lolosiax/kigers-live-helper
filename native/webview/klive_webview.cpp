@@ -24,6 +24,7 @@
 
 #include <WebView2.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdarg>
@@ -48,6 +49,7 @@ using json = nlohmann::json;
 constexpr UINT kWmTray = WM_APP + 1;
 constexpr UINT kWmStopAndDestroy = WM_APP + 2;
 constexpr UINT kWmShowPanel = WM_APP + 3;
+constexpr UINT kWmCycleMode = WM_APP + 4;
 constexpr UINT kTrayIconId = 1;
 constexpr UINT kMenuShow = 1;
 constexpr UINT kMenuStop = 2;
@@ -147,6 +149,70 @@ std::wstring JoinPath(const std::wstring& directory, const std::wstring& relativ
     return directory + L"\\" + relative;
 }
 
+// ---------------------------------------------------------------------------
+// 用户数据目录
+//
+// 设置属于用户数据，不能跟着 keel 的工作根走：keelRun 会重建 build/keel-run，
+// 单文件 exe 也可能从程序目录回退到 %LOCALAPPDATA%\keel\cache（共享缓存目录）。
+// 这里统一放到 %LOCALAPPDATA%\klive，和 WebView2 的 profile 同根。
+// ---------------------------------------------------------------------------
+
+std::wstring DataRootDir() {
+    wchar_t buffer[MAX_PATH] = {};
+    DWORD length = GetEnvironmentVariableW(L"LOCALAPPDATA", buffer, ARRAYSIZE(buffer));
+    std::wstring root = length > 0 ? std::wstring(buffer, length) : std::wstring(L".");
+    std::wstring directory = JoinPath(root, L"klive");
+    SHCreateDirectoryExW(nullptr, directory.c_str(), nullptr);
+    return directory;
+}
+
+std::wstring SettingsFilePath() {
+    return JoinPath(DataRootDir(), L"settings.json");
+}
+
+std::string ReadFileUtf8(const std::wstring& path) {
+    HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                              nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return {};
+
+    LARGE_INTEGER size{};
+    if (!GetFileSizeEx(file, &size) || size.QuadPart <= 0 || size.QuadPart > 1024 * 1024) {
+        CloseHandle(file);
+        return {};
+    }
+
+    std::string text(static_cast<size_t>(size.QuadPart), '\0');
+    DWORD read = 0;
+    const BOOL ok = ReadFile(file, text.data(), static_cast<DWORD>(text.size()), &read, nullptr);
+    CloseHandle(file);
+    if (!ok) return {};
+    text.resize(read);
+    return text;
+}
+
+/* 先写 .tmp 再原子替换，避免掉电 / 崩溃留下半截 JSON。 */
+bool WriteFileUtf8(const std::wstring& path, const std::string& text) {
+    const std::wstring temporary = path + L".tmp";
+    HANDLE file = CreateFileW(temporary.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                              FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return false;
+
+    DWORD written = 0;
+    const BOOL ok =
+        WriteFile(file, text.data(), static_cast<DWORD>(text.size()), &written, nullptr);
+    CloseHandle(file);
+    if (!ok || written != text.size()) {
+        DeleteFileW(temporary.c_str());
+        return false;
+    }
+    if (!MoveFileExW(temporary.c_str(), path.c_str(),
+                     MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        DeleteFileW(temporary.c_str());
+        return false;
+    }
+    return true;
+}
+
 /**
  * `LoadLibraryExW` 的 `LOAD_LIBRARY_SEARCH_*` 只接受绝对路径；
  * Host 传进来的物化目录可能是相对路径（取决于 `--plugins` 参数）。
@@ -173,6 +239,8 @@ struct CaptureApi {
     int32_t (*start_mirror)(const klive_mirror_config*) = nullptr;
     int32_t (*stop_mirror)() = nullptr;
     int32_t (*is_running)() = nullptr;
+    int32_t (*set_mode)(int32_t) = nullptr;
+    int32_t (*get_mode)() = nullptr;
     void (*get_stats)(klive_mirror_stats*) = nullptr;
     const char* (*last_message)() = nullptr;
     void (*shutdown)() = nullptr;
@@ -207,6 +275,8 @@ bool LoadCaptureApi(const std::wstring& native_dir) {
     g_api.stop_mirror =
         reinterpret_cast<decltype(g_api.stop_mirror)>(resolve("klive_stop_mirror"));
     g_api.is_running = reinterpret_cast<decltype(g_api.is_running)>(resolve("klive_is_running"));
+    g_api.set_mode = reinterpret_cast<decltype(g_api.set_mode)>(resolve("klive_set_mode"));
+    g_api.get_mode = reinterpret_cast<decltype(g_api.get_mode)>(resolve("klive_get_mode"));
     g_api.get_stats = reinterpret_cast<decltype(g_api.get_stats)>(resolve("klive_get_stats"));
     g_api.last_message =
         reinterpret_cast<decltype(g_api.last_message)>(resolve("klive_last_message"));
@@ -215,6 +285,7 @@ bool LoadCaptureApi(const std::wstring& native_dir) {
     if (g_api.initialize == nullptr || g_api.enumerate_monitors == nullptr ||
         g_api.enumerate_windows == nullptr || g_api.start_mirror == nullptr ||
         g_api.stop_mirror == nullptr || g_api.is_running == nullptr ||
+        g_api.set_mode == nullptr || g_api.get_mode == nullptr ||
         g_api.get_stats == nullptr || g_api.last_message == nullptr) {
         SetError("klive_capture.dll 缺少必要的导出函数");
         FreeLibrary(module);
@@ -254,6 +325,9 @@ struct UiContext {
     bool devtools = false;
     void (*open_console)(void*) = nullptr;
     void* open_console_user = nullptr;
+    std::string settings_json;
+    void (*save_settings)(const char*, void*) = nullptr;
+    void* save_settings_user = nullptr;
 
     std::promise<int32_t> init;
     std::atomic<bool> init_done{false};
@@ -290,6 +364,39 @@ void FillTrayData(NOTIFYICONDATAW& data, HWND hwnd) {
     data.uCallbackMessage = kWmTray;
     data.hIcon = g_icon != nullptr ? g_icon : LoadIconW(nullptr, IDI_APPLICATION);
     lstrcpynW(data.szTip, L"Kiger\u76f4\u64ad\u52a9\u624b", ARRAYSIZE(data.szTip));
+}
+
+const wchar_t* ModeLabel(int32_t mode) {
+    switch (mode) {
+        case KLIVE_MODE_POINTER_MONITOR:
+            return L"\u8ddf\u968f\u9f20\u6807\u5c4f\u5e55";
+        case KLIVE_MODE_POINTER_WINDOW:
+            return L"\u9f20\u6807\u4e0b\u7a97\u53e3";
+        case KLIVE_MODE_FOCUS_WINDOW:
+            return L"\u524d\u53f0\u7a97\u53e3";
+        case KLIVE_MODE_ZOOM_2X:
+            return L"2\u00d7 \u7f29\u653e";
+        case KLIVE_MODE_ZOOM_3X:
+            return L"3\u00d7 \u7f29\u653e";
+        case KLIVE_MODE_ZOOM_4X:
+            return L"4\u00d7 \u7f29\u653e";
+        default:
+            return L"\u5168\u5c4f\u955c\u50cf";
+    }
+}
+
+/* 侧键切档后给一条托盘气泡：镜像窗口在另一块屏上时面板通常看不到。 */
+void ShowTrayInfo(const wchar_t* title, const wchar_t* text) {
+    if (g_tray_hwnd == nullptr) return;
+    NOTIFYICONDATAW data{};
+    data.cbSize = sizeof(data);
+    data.hWnd = g_tray_hwnd;
+    data.uID = kTrayIconId;
+    data.uFlags = NIF_INFO;
+    data.dwInfoFlags = NIIF_NONE;
+    lstrcpynW(data.szInfoTitle, title, ARRAYSIZE(data.szInfoTitle));
+    lstrcpynW(data.szInfo, text, ARRAYSIZE(data.szInfo));
+    Shell_NotifyIconW(NIM_MODIFY, &data);
 }
 
 void AddTrayIcon(HWND hwnd) {
@@ -339,6 +446,80 @@ void StopMirror() {
 }
 
 // ---------------------------------------------------------------------------
+// 鼠标侧键（XBUTTON1/2）全局钩子
+//
+// 低级鼠标钩子不注入其它进程，也不需要管理员权限；但回调必须足够快，
+// 超时会被系统静默摘掉，所以这里只 PostMessage，真正的切档在 UI 线程做。
+// 只在镜像运行中吞掉侧键：空闲时保留浏览器 / 资源管理器原本的前进后退。
+// ---------------------------------------------------------------------------
+
+/*
+ * 钩子跑在独立线程上：低级钩子回调超时会被系统静默摘掉，而 UI 线程要跑
+ * WebView2 回调、启停镜像（stop 会 join worker），不能保证 300ms 内回消息。
+ */
+HHOOK g_mouse_hook = nullptr;
+std::thread g_hook_thread;
+std::atomic<DWORD> g_hook_thread_id{0};
+std::atomic<bool> g_hook_ready{false};
+
+LRESULT CALLBACK MouseHookProc(int code, WPARAM wparam, LPARAM lparam) {
+    if (code == HC_ACTION && (wparam == WM_XBUTTONDOWN || wparam == WM_XBUTTONUP)) {
+        const auto* info = reinterpret_cast<const MSLLHOOKSTRUCT*>(lparam);
+        const WORD button = HIWORD(info->mouseData);
+        const bool mirroring = g_api.is_running != nullptr && g_api.is_running() != 0;
+        if ((button == XBUTTON1 || button == XBUTTON2) && mirroring) {
+            if (wparam == WM_XBUTTONDOWN) {
+                // 0 = 后退键（上一档），1 = 前进键（下一档）
+                const WPARAM step = button == XBUTTON1 ? 0 : 1;
+                PostMessageW(g_hwnd.load(), kWmCycleMode, step, 0);
+            }
+            // 按下与抬起都吞掉，避免目标程序收到孤立的抬起事件
+            return 1;
+        }
+    }
+    return CallNextHookEx(g_mouse_hook, code, wparam, lparam);
+}
+
+void MouseHookThreadMain() {
+    g_hook_thread_id.store(GetCurrentThreadId());
+    g_mouse_hook = SetWindowsHookExW(WH_MOUSE_LL, MouseHookProc, ModuleHandle(), 0);
+    if (g_mouse_hook == nullptr) {
+        Log("[webview] SetWindowsHookEx(WH_MOUSE_LL) 失败：%lu", GetLastError());
+        g_hook_thread_id.store(0);
+        return;
+    }
+    g_hook_ready.store(true);
+    Log("[webview] mouse side buttons hooked");
+
+    MSG message;
+    while (GetMessageW(&message, nullptr, 0, 0) > 0) {
+        TranslateMessage(&message);
+        DispatchMessageW(&message);
+    }
+
+    UnhookWindowsHookEx(g_mouse_hook);
+    g_mouse_hook = nullptr;
+    g_hook_ready.store(false);
+    g_hook_thread_id.store(0);
+}
+
+bool InstallMouseHook() {
+    if (g_hook_thread.joinable()) return true;
+    g_hook_ready.store(false);
+    g_hook_thread = std::thread(MouseHookThreadMain);
+    // 等钩子挂上再返回，日志里能确定安装结果
+    for (int attempt = 0; attempt < 50 && !g_hook_ready.load(); ++attempt) Sleep(2);
+    return g_hook_ready.load();
+}
+
+void UninstallMouseHook() {
+    if (!g_hook_thread.joinable()) return;
+    const DWORD thread_id = g_hook_thread_id.load();
+    if (thread_id != 0) PostThreadMessageW(thread_id, WM_QUIT, 0, 0);
+    g_hook_thread.join();
+}
+
+// ---------------------------------------------------------------------------
 // JSON 桥
 // ---------------------------------------------------------------------------
 
@@ -347,13 +528,18 @@ struct BridgeError {
     std::string message;
 };
 
-json BuildMonitors() {
+std::vector<klive_monitor_desc> EnumerateMonitors() {
     constexpr int kCapacity = 16;
     std::vector<klive_monitor_desc> items(kCapacity);
-    int count = g_api.enumerate_monitors(items.data(), kCapacity);
+    const int count = g_api.enumerate_monitors(items.data(), kCapacity);
+    items.resize(static_cast<size_t>(std::max(count, 0)));
+    return items;
+}
+
+json BuildMonitors() {
+    const std::vector<klive_monitor_desc> items = EnumerateMonitors();
     json array = json::array();
-    for (int i = 0; i < count; ++i) {
-        const klive_monitor_desc& item = items[static_cast<size_t>(i)];
+    for (const klive_monitor_desc& item : items) {
         array.push_back(json{
             {"index", item.index},
             {"name", FixedToUtf8(item.name, sizeof(item.name))},
@@ -392,6 +578,119 @@ json BuildWindows() {
     return array;
 }
 
+// ---------------------------------------------------------------------------
+// 镜像设置（档位与全屏档的显示器选择）
+//
+// 屏幕按 DXGI 设备名 + 型号持久化，不按 index：热插拔或改显示配置后 index 会漂移。
+// 只在这里读写，调用点都在 UI 线程（桥消息、侧键、启动参数）。
+// ---------------------------------------------------------------------------
+
+struct MirrorSettings {
+    int32_t mode = KLIVE_MODE_FULLSCREEN;
+    std::string source_monitor;
+    std::string source_friendly;
+    std::string target_monitor;
+    std::string target_friendly;
+    int32_t source_index = -1;
+    int32_t target_index = -1;
+};
+
+MirrorSettings g_settings;
+
+void ResolveSettingsMonitors() {
+    const std::vector<klive_monitor_desc> monitors = EnumerateMonitors();
+    auto find = [&monitors](const std::string& name, const std::string& friendly) -> int32_t {
+        if (!name.empty()) {
+            for (const klive_monitor_desc& item : monitors) {
+                if (name == FixedToUtf8(item.name, sizeof(item.name))) return item.index;
+            }
+        }
+        if (!friendly.empty()) {
+            for (const klive_monitor_desc& item : monitors) {
+                if (friendly == FixedToUtf8(item.friendly_name, sizeof(item.friendly_name))) {
+                    return item.index;
+                }
+            }
+        }
+        return -1;
+    };
+    g_settings.source_index = find(g_settings.source_monitor, g_settings.source_friendly);
+    g_settings.target_index = find(g_settings.target_monitor, g_settings.target_friendly);
+}
+
+void ApplySettingsJson(const char* text) {
+    g_settings = MirrorSettings{};
+    Log("[webview] settings json: %s", text != nullptr ? text : "");
+    if (text != nullptr && *text != '\0') {
+        try {
+            const json value = json::parse(text);
+            g_settings.mode = value.value("mode", 0);
+            g_settings.source_monitor = value.value("sourceMonitor", std::string());
+            g_settings.source_friendly = value.value("sourceFriendly", std::string());
+            g_settings.target_monitor = value.value("targetMonitor", std::string());
+            g_settings.target_friendly = value.value("targetFriendly", std::string());
+        } catch (const std::exception& error) {
+            Log("[webview] settings json 无法解析：%s", error.what());
+        }
+    }
+    if (g_settings.mode < 0 || g_settings.mode >= KLIVE_MODE_COUNT) g_settings.mode = 0;
+    ResolveSettingsMonitors();
+    Log("[webview] settings: mode=%d source=%d target=%d", g_settings.mode, g_settings.source_index,
+        g_settings.target_index);
+}
+
+/* source_index < 0 表示保留原来的源（例如用窗口做全屏镜像时）。 */
+void UpdateSettings(int32_t mode, int32_t source_index, int32_t target_index) {
+    const std::vector<klive_monitor_desc> monitors = EnumerateMonitors();
+    auto assign = [&monitors](int32_t index, std::string& name, std::string& friendly) {
+        if (index < 0) return;
+        for (const klive_monitor_desc& item : monitors) {
+            if (item.index != index) continue;
+            name = FixedToUtf8(item.name, sizeof(item.name));
+            friendly = FixedToUtf8(item.friendly_name, sizeof(item.friendly_name));
+            return;
+        }
+    };
+    g_settings.mode = mode;
+    assign(source_index, g_settings.source_monitor, g_settings.source_friendly);
+    assign(target_index, g_settings.target_monitor, g_settings.target_friendly);
+    ResolveSettingsMonitors();
+}
+
+std::string SettingsJson() {
+    return json{
+        {"mode", g_settings.mode},
+        {"sourceMonitor", g_settings.source_monitor},
+        {"sourceFriendly", g_settings.source_friendly},
+        {"targetMonitor", g_settings.target_monitor},
+        {"targetFriendly", g_settings.target_friendly},
+    }
+        .dump();
+}
+
+void SaveSettings() {
+    const std::string text = SettingsJson();
+    const std::wstring path = SettingsFilePath();
+    if (WriteFileUtf8(path, text)) {
+        Log("[webview] 设置已写入：%s", WideToUtf8(path).c_str());
+    } else {
+        Log("[webview] 设置写入失败：%s", WideToUtf8(path).c_str());
+    }
+    // 兼容 keel 插件配置：Host 侧仍保留一份镜像，读不到用户目录时还能恢复
+    if (g_ui != nullptr && g_ui->save_settings != nullptr) {
+        g_ui->save_settings(text.c_str(), g_ui->save_settings_user);
+    }
+}
+
+json BuildSettingsInfo() {
+    ResolveSettingsMonitors();
+    return json{
+        {"mode", g_settings.mode},
+        {"sourceIndex", g_settings.source_index},
+        {"targetIndex", g_settings.target_index},
+    };
+}
+
 json BuildStats() {
     klive_mirror_stats stats{};
     g_api.get_stats(&stats);
@@ -402,6 +701,8 @@ json BuildStats() {
         {"frameWidth", stats.frame_width},
         {"frameHeight", stats.frame_height},
         {"lastError", stats.last_error},
+        {"mode", stats.mode},
+        {"sourceIndex", stats.source_index},
     };
 }
 
@@ -423,6 +724,24 @@ json Dispatch(const std::string& method, const json& params) {
     }
     if (method == "getStats") {
         return BuildStats();
+    }
+    if (method == "getSettings") {
+        return BuildSettingsInfo();
+    }
+    if (method == "saveSettings") {
+        const int32_t mode = params.value("mode", g_settings.mode);
+        if (mode < 0 || mode >= KLIVE_MODE_COUNT) {
+            throw BridgeError{KLIVE_WEBVIEW_E_INVALID_ARG, "镜像档位无效"};
+        }
+        const int32_t source_index = params.value("sourceIndex", g_settings.source_index);
+        const int32_t target_index = params.value("targetIndex", g_settings.target_index);
+        UpdateSettings(mode, source_index, target_index);
+        // 运行中改档位立即生效；未运行时只是记下下次启动的默认值
+        g_api.set_mode(mode);
+        SaveSettings();
+        Log("[webview] settings saved: mode=%d source=%d target=%d", mode, source_index,
+            target_index);
+        return nullptr;
     }
     if (method == "lastMessage") {
         return CaptureMessage();
@@ -451,14 +770,20 @@ json Dispatch(const std::string& method, const json& params) {
         config.vsync = params.value("vsync", true) ? 1 : 0;
         config.capture_backend = params.value("captureBackend", 1);
         config.source_kind = params.value("sourceKind", 0);
+        config.mode = params.value("mode", g_settings.mode);
         if (config.source_kind == KLIVE_SOURCE_WINDOW) {
             // 窗口采集只能走 WGC
             config.capture_backend = KLIVE_CAPTURE_WGC;
         }
         int32_t code = g_api.start_mirror(&config);
         if (code != 0) throw BridgeError{code, CaptureMessage()};
-        Log("[webview] mirror started: source=%d target=%d kind=%d", config.source_index,
-            config.target_index, config.source_kind);
+        // 全屏档记住了显示器；窗口源没有稳定身份，保留原来的显示器选择
+        UpdateSettings(
+            config.mode, config.source_kind == KLIVE_SOURCE_MONITOR ? config.source_index : -1,
+            config.target_index);
+        SaveSettings();
+        Log("[webview] mirror started: source=%d target=%d kind=%d mode=%d", config.source_index,
+            config.target_index, config.source_kind, config.mode);
         return nullptr;
     }
     throw BridgeError{KLIVE_WEBVIEW_E_INVALID_ARG, "未知方法：" + method};
@@ -878,6 +1203,17 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpara
             ShowWindow(hwnd, SW_SHOW);
             SetForegroundWindow(hwnd);
             return 0;
+        case kWmCycleMode: {
+            const int32_t current = g_api.get_mode();
+            const int32_t delta = wparam == 0 ? -1 : 1;
+            const int32_t next = (current + delta + KLIVE_MODE_COUNT) % KLIVE_MODE_COUNT;
+            if (g_api.set_mode(next) != 0) return 0;
+            g_settings.mode = next;
+            SaveSettings();
+            ShowTrayInfo(L"Kiger\u76f4\u64ad\u52a9\u624b", ModeLabel(next));
+            Log("[webview] mode -> %d", next);
+            return 0;
+        }
         case kWmStopAndDestroy:
             StopMirror();
             RemoveTrayIcon();
@@ -1022,6 +1358,8 @@ void UiThreadMain(UiContext* context) {
     g_ui = context;
     Log("[webview] window dpi=%u size=%dx%d", GetDpiForWindow(hwnd), width, height);
     AddTrayIcon(hwnd);
+    // 低级鼠标钩子必须挂在有消息循环的线程上，UI 线程正好满足
+    InstallMouseHook();
     CreateWebView(context);
 
     MSG message;
@@ -1029,6 +1367,9 @@ void UiThreadMain(UiContext* context) {
         TranslateMessage(&message);
         DispatchMessageW(&message);
     }
+
+    // 必须在本 DLL 卸载前摘钩子，否则回调指针会指向已卸载的代码
+    UninstallMouseHook();
 
     // 插件重载时本 DLL 会被卸下再加载；窗口类不注销会把旧模块的 wndproc 留在进程里
     UnregisterClassW(kWindowClass, ModuleHandle());
@@ -1047,10 +1388,7 @@ void UiThreadMain(UiContext* context) {
 }
 
 std::wstring DefaultUserDataDir() {
-    wchar_t buffer[MAX_PATH] = {};
-    DWORD length = GetEnvironmentVariableW(L"LOCALAPPDATA", buffer, ARRAYSIZE(buffer));
-    std::wstring root = length > 0 ? std::wstring(buffer, length) : std::wstring(L".");
-    std::wstring directory = JoinPath(root, L"klive\\WebView2");
+    std::wstring directory = JoinPath(DataRootDir(), L"WebView2");
     SHCreateDirectoryExW(nullptr, directory.c_str(), nullptr);
     return directory;
 }
@@ -1094,10 +1432,22 @@ int32_t klive_webview_start(const klive_webview_config* config) {
     context->devtools = config->enable_devtools != 0;
     context->open_console = config->open_console;
     context->open_console_user = config->open_console_user;
+    context->settings_json =
+        config->settings_json != nullptr ? std::string(config->settings_json) : std::string();
+    context->save_settings = config->save_settings;
+    context->save_settings_user = config->save_settings_user;
 
     if (!LoadCaptureApi(context->native_dir)) {
         delete context;
         return KLIVE_WEBVIEW_E_CAPTURE;
+    }
+    // 用户目录优先；没有时才用 keel 插件配置做首次迁移的种子
+    const std::string stored = ReadFileUtf8(SettingsFilePath());
+    if (!stored.empty()) {
+        Log("[webview] 读取用户设置：%s", WideToUtf8(SettingsFilePath()).c_str());
+        ApplySettingsJson(stored.c_str());
+    } else {
+        ApplySettingsJson(context->settings_json.c_str());
     }
 
     std::future<int32_t> init_result = context->init.get_future();

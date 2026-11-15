@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstring>
+#include <cwchar>
 #include <iterator>
 #include <memory>
 
@@ -14,10 +15,14 @@ namespace {
 
 constexpr wchar_t kWindowClass[] = L"KliveMirrorWindow";
 constexpr int kHotkeyId = 0xC1;
+/* 动态档位重新解析采集源的间隔：太短会把设备重建拖成抖动，太长跟随会迟钝。 */
+constexpr auto kSourceProbeInterval = std::chrono::milliseconds(250);
 
 const char* kShaderSource = R"(
 cbuffer Params : register(b0) {
-    float2 gScale;
+    float2 gScale;    // 四边形缩放，负责等比填充 / 拉伸铺满
+    float2 gUvScale;  // 采样范围，缩放档位时 = 1/倍数
+    float2 gUvOffset; // 采样起点，按鼠标位置居中后夹取到边缘内
     float2 gPad;
 };
 
@@ -39,12 +44,14 @@ VSOut VSMain(uint id : SV_VertexID) {
 }
 
 float4 PSMain(VSOut i) : SV_TARGET {
-    return gSource.Sample(gSampler, i.uv);
+    return gSource.Sample(gSampler, i.uv * gUvScale + gUvOffset);
 }
 )";
 
 struct ScaleParams {
     float scale[2];
+    float uv_scale[2];
+    float uv_offset[2];
     float pad[2];
 };
 
@@ -54,6 +61,14 @@ struct Pipeline {
     ComPtr<ID3D11SamplerState> sampler;
     ComPtr<ID3D11Buffer> params;
     ComPtr<ID3D11RasterizerState> rasterizer;
+
+    void reset() {
+        vertex.Reset();
+        pixel.Reset();
+        sampler.Reset();
+        params.Reset();
+        rasterizer.Reset();
+    }
 
     bool create(ID3D11Device* device) {
         ComPtr<ID3DBlob> vs_blob;
@@ -209,6 +224,259 @@ bool create_device(IDXGIAdapter* adapter, ComPtr<ID3D11Device>& device,
     return true;
 }
 
+bool is_desktop_window(HWND window) {
+    wchar_t name[64]{};
+    GetClassNameW(window, name, static_cast<int>(std::size(name)));
+    return wcscmp(name, L"Progman") == 0 || wcscmp(name, L"WorkerW") == 0 ||
+           wcscmp(name, L"Shell_TrayWnd") == 0;
+}
+
+/* 鼠标 / 前台窗口 → 顶层窗口；桌面、本进程窗口、不可采集窗口返回 false。 */
+bool resolve_window_source(HWND window, int64_t& out) {
+    if (window == nullptr) return false;
+    HWND root = GetAncestor(window, GA_ROOT);
+    if (root == nullptr) root = window;
+    if (is_desktop_window(root)) return false;
+    if (!klive_is_capturable_window(root)) return false;
+    out = static_cast<int64_t>(reinterpret_cast<intptr_t>(root));
+    return true;
+}
+
+int32_t find_output_by_monitor(const std::vector<KliveOutput>& outputs, HMONITOR monitor) {
+    for (size_t i = 0; i < outputs.size(); ++i) {
+        if (outputs[i].desc.Monitor == monitor) return static_cast<int32_t>(i);
+    }
+    return -1;
+}
+
+int32_t zoom_factor_for_mode(int32_t mode) {
+    switch (mode) {
+        case KLIVE_MODE_ZOOM_2X:
+            return 2;
+        case KLIVE_MODE_ZOOM_3X:
+            return 3;
+        case KLIVE_MODE_ZOOM_4X:
+            return 4;
+        default:
+            return 1;
+    }
+}
+
+/**
+ * 一台镜像会话的运行时状态。
+ *
+ * 设备、交换链、管线与采集源都挂在目标窗口上；动态档位换源时只重建必要部分：
+ * 同显卡只换 FrameSource，跨显卡才重建 device / swapchain（窗口本身不动）。
+ */
+struct MirrorContext {
+    const std::vector<KliveOutput>* outputs = nullptr;
+    HWND hwnd = nullptr;
+    int32_t target_index = -1;
+    int32_t source_kind = KLIVE_SOURCE_MONITOR;
+    int32_t source_index = -1;
+    int64_t window_handle = 0;
+    int32_t scale_mode = 0;
+    bool vsync = true;
+    int32_t capture_backend = KLIVE_CAPTURE_WGC;
+
+    int32_t device_output = -1;
+    /*
+     * 整个会话只用一个 DXGI 工厂：窗口关联（MakeWindowAssociation）是进程级的，
+     * 换卡重建时若换一个新工厂，CreateSwapChainForHwnd 会报 E_ACCESSDENIED。
+     */
+    ComPtr<IDXGIFactory2> factory;
+    ComPtr<ID3D11Device> device;
+    ComPtr<ID3D11DeviceContext> context;
+    ComPtr<IDXGISwapChain1> swap_chain;
+    ComPtr<ID3D11RenderTargetView> render_target;
+    Pipeline pipeline;
+    std::unique_ptr<FrameSource> source;
+    int32_t resolved_kind = -1;
+    int32_t resolved_index = -1;
+    int64_t resolved_window = 0;
+    bool clear_next = false;
+};
+
+bool resize_render_target(MirrorContext& ctx) {
+    ctx.render_target.Reset();
+    if (!ctx.swap_chain || g_window.width == 0 || g_window.height == 0) return false;
+    if (FAILED(ctx.swap_chain->ResizeBuffers(0, g_window.width, g_window.height, DXGI_FORMAT_UNKNOWN,
+                                             0))) {
+        return false;
+    }
+
+    ComPtr<ID3D11Texture2D> back_buffer;
+    if (FAILED(ctx.swap_chain->GetBuffer(0, IID_PPV_ARGS(&back_buffer)))) return false;
+    if (FAILED(ctx.device->CreateRenderTargetView(back_buffer.Get(), nullptr, &ctx.render_target))) {
+        return false;
+    }
+
+    D3D11_VIEWPORT viewport{};
+    viewport.Width = static_cast<float>(g_window.width);
+    viewport.Height = static_cast<float>(g_window.height);
+    viewport.MaxDepth = 1.0f;
+    ctx.context->RSSetViewports(1, &viewport);
+    return true;
+}
+
+bool ensure_factory(MirrorContext& ctx) {
+    if (ctx.factory) return true;
+    ComPtr<IDXGIFactory1> factory1;
+    if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory1))) ||
+        FAILED(factory1.As(&ctx.factory)) || !ctx.factory) {
+        klive_set_message("获取 DXGI 工厂失败");
+        return false;
+    }
+    ctx.factory->MakeWindowAssociation(ctx.hwnd, DXGI_MWA_NO_ALT_ENTER);
+    return true;
+}
+
+bool create_swap_chain(MirrorContext& ctx) {
+    if (!ensure_factory(ctx)) return false;
+
+    DXGI_SWAP_CHAIN_DESC1 swap_desc{};
+    swap_desc.Width = g_window.width;
+    swap_desc.Height = g_window.height;
+    swap_desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    swap_desc.SampleDesc.Count = 1;
+    swap_desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    swap_desc.BufferCount = 2;
+    swap_desc.Scaling = DXGI_SCALING_STRETCH;
+    swap_desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+    swap_desc.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
+
+    const HRESULT hr = ctx.factory->CreateSwapChainForHwnd(ctx.device.Get(), ctx.hwnd, &swap_desc,
+                                                            nullptr, nullptr, &ctx.swap_chain);
+    if (FAILED(hr)) {
+        set_dxgi_error("创建交换链", hr);
+        return false;
+    }
+    return resize_render_target(ctx);
+}
+
+/* 设备建在 output_index 这台显示器所属显卡上；跨卡换源时才重建整套呈现资源。 */
+bool ensure_device(MirrorContext& ctx, int32_t output_index, const char* stage) {
+    if (ctx.device && ctx.device_output == output_index) return true;
+
+    ctx.source.reset();
+    ctx.resolved_kind = -1;
+    ctx.resolved_index = -1;
+    ctx.resolved_window = 0;
+    /*
+     * 一个 HWND 同一时刻只能挂一个 flip 模型交换链，而 D3D11 会延迟销毁对象：
+     * 必须先释放旧视图 / 交换链，再 ClearState + Flush 强制销毁，最后才能
+     * CreateSwapChainForHwnd 建新的；顺序反了会报 E_ACCESSDENIED（0x80070005）。
+     */
+    ctx.render_target.Reset();
+    ctx.pipeline.reset();
+    ctx.swap_chain.Reset();
+    if (ctx.context) {
+        ctx.context->ClearState();
+        ctx.context->Flush();
+    }
+    ctx.context.Reset();
+    ctx.device.Reset();
+    ctx.device_output = -1;
+
+    const KliveOutput& output = (*ctx.outputs)[static_cast<size_t>(output_index)];
+    if (!create_device(output.adapter.Get(), ctx.device, ctx.context, stage)) return false;
+    if (!create_swap_chain(ctx)) return false;
+    if (!ctx.pipeline.create(ctx.device.Get())) {
+        klive_set_message("初始化渲染管线失败");
+        return false;
+    }
+
+    ctx.device_output = output_index;
+    ctx.clear_next = true;
+    return true;
+}
+
+std::unique_ptr<FrameSource> create_source(MirrorContext& ctx, int32_t kind, int32_t index,
+                                           int64_t handle) {
+    if (kind == KLIVE_SOURCE_WINDOW) {
+        return klive_create_wgc_window_source(reinterpret_cast<HWND>(static_cast<intptr_t>(handle)),
+                                              ctx.device.Get());
+    }
+
+    const KliveOutput& output = (*ctx.outputs)[static_cast<size_t>(index)];
+    if (ctx.capture_backend == KLIVE_CAPTURE_WGC) {
+        return klive_create_wgc_monitor_source(output.desc.Monitor, ctx.device.Get());
+    }
+    return klive_create_duplication_source(output, ctx.device.Get());
+}
+
+/* 返回值：KLIVE_OK 成功；KLIVE_E_DEVICE 致命；其它为本次换源失败（下一轮重试）。 */
+int32_t switch_source(MirrorContext& ctx, int32_t kind, int32_t index, int64_t handle) {
+    const bool same = ctx.source != nullptr && ctx.resolved_kind == kind &&
+                      (kind == KLIVE_SOURCE_WINDOW ? ctx.resolved_window == handle
+                                                   : ctx.resolved_index == index);
+    if (same) return KLIVE_OK;
+
+    const int32_t device_output = kind == KLIVE_SOURCE_WINDOW ? ctx.target_index : index;
+    if (!ensure_device(ctx, device_output, "切换采集源")) return KLIVE_E_DEVICE;
+
+    std::unique_ptr<FrameSource> next = create_source(ctx, kind, index, handle);
+    if (!next) {
+        if (kind == KLIVE_SOURCE_WINDOW) return KLIVE_E_WINDOW;
+        return ctx.capture_backend == KLIVE_CAPTURE_WGC ? KLIVE_E_CAPTURE : KLIVE_E_DUPLICATION;
+    }
+
+    ctx.source = std::move(next);
+    ctx.resolved_kind = kind;
+    ctx.resolved_index = kind == KLIVE_SOURCE_MONITOR ? index : -1;
+    ctx.resolved_window = kind == KLIVE_SOURCE_WINDOW ? handle : 0;
+    // 换源后旧画面不再代表当前内容，先清成黑屏，等新源出第一帧
+    ctx.clear_next = true;
+    return KLIVE_OK;
+}
+
+/* 按档位解析当前应该采集谁；解析不出来（鼠标在目标屏 / 没有可用窗口）返回 false。 */
+bool resolve_source(const MirrorContext& ctx, int32_t mode, int32_t& kind, int32_t& index,
+                    int64_t& handle) {
+    kind = KLIVE_SOURCE_MONITOR;
+    index = -1;
+    handle = 0;
+
+    switch (mode) {
+        case KLIVE_MODE_FULLSCREEN:
+            kind = ctx.source_kind;
+            index = ctx.source_index;
+            handle = ctx.window_handle;
+            return true;
+
+        case KLIVE_MODE_POINTER_MONITOR:
+        case KLIVE_MODE_ZOOM_2X:
+        case KLIVE_MODE_ZOOM_3X:
+        case KLIVE_MODE_ZOOM_4X: {
+            POINT cursor{};
+            GetCursorPos(&cursor);
+            const HMONITOR monitor = MonitorFromPoint(cursor, MONITOR_DEFAULTTONULL);
+            const int32_t found = find_output_by_monitor(*ctx.outputs, monitor);
+            // 目标屏上显示的就是镜像本身，采它会形成无限套娃
+            if (found < 0 || found == ctx.target_index) return false;
+            index = found;
+            return true;
+        }
+
+        case KLIVE_MODE_POINTER_WINDOW: {
+            POINT cursor{};
+            GetCursorPos(&cursor);
+            if (!resolve_window_source(WindowFromPoint(cursor), handle)) return false;
+            kind = KLIVE_SOURCE_WINDOW;
+            return true;
+        }
+
+        case KLIVE_MODE_FOCUS_WINDOW: {
+            if (!resolve_window_source(GetForegroundWindow(), handle)) return false;
+            kind = KLIVE_SOURCE_WINDOW;
+            return true;
+        }
+
+        default:
+            return false;
+    }
+}
+
 int32_t run_mirror(KliveMirrorSession& session, const klive_mirror_config& config) {
     using Clock = std::chrono::steady_clock;
     std::vector<KliveOutput> outputs = klive_collect_outputs();
@@ -217,33 +485,27 @@ int32_t run_mirror(KliveMirrorSession& session, const klive_mirror_config& confi
         return KLIVE_E_NO_MONITOR;
     }
 
-    const bool window_source = config.source_kind == KLIVE_SOURCE_WINDOW;
+    const int32_t initial_mode = session.mode.load();
+    const bool dynamic = initial_mode != KLIVE_MODE_FULLSCREEN;
     if (config.target_index < 0 || config.target_index >= static_cast<int32_t>(outputs.size())) {
         klive_set_message("目标显示器编号无效");
         return KLIVE_E_INVALID_ARG;
     }
-    if (window_source) {
-        if (config.window_handle == 0) {
-            klive_set_message("没有选择采集窗口");
+    // 动态档位由鼠标 / 前台窗口决定源，固定 source_index / window_handle 不参与校验
+    if (!dynamic) {
+        if (config.source_kind == KLIVE_SOURCE_WINDOW) {
+            if (config.window_handle == 0) {
+                klive_set_message("没有选择采集窗口");
+                return KLIVE_E_INVALID_ARG;
+            }
+        } else if (config.source_index < 0 ||
+                   config.source_index >= static_cast<int32_t>(outputs.size())) {
+            klive_set_message("源显示器编号无效");
             return KLIVE_E_INVALID_ARG;
         }
-    } else if (config.source_index < 0 ||
-               config.source_index >= static_cast<int32_t>(outputs.size())) {
-        klive_set_message("源显示器编号无效");
-        return KLIVE_E_INVALID_ARG;
     }
 
     const KliveOutput& target = outputs[config.target_index];
-    // 窗口采集时，设备建在目标显示器所在显卡上（WGC 会在我们的设备上建帧纹理）
-    const KliveOutput& source = window_source ? target : outputs[config.source_index];
-
-    // 设备建在源显示器所在显卡上；即使目标显示器挂在另一块卡上，
-    // 向它的窗口 Present 也由 DWM 完成跨卡合成（实测可用）。
-    ComPtr<ID3D11Device> device;
-    ComPtr<ID3D11DeviceContext> context;
-    if (!create_device(source.adapter.Get(), device, context, "创建 D3D11 设备")) {
-        return KLIVE_E_DEVICE;
-    }
 
     // 镜像窗口：无边框 + 置顶，直接铺满目标显示器；TOOLWINDOW 让它不进任务栏 / Alt+Tab
     HINSTANCE instance = GetModuleHandleW(nullptr);
@@ -270,93 +532,58 @@ int32_t run_mirror(KliveMirrorSession& session, const klive_mirror_config& confi
     g_window.height = static_cast<uint32_t>(window_height);
     g_window.resized = false;
 
-    ComPtr<IDXGIDevice> dxgi_device;
-    ComPtr<IDXGIAdapter> dxgi_adapter;
-    ComPtr<IDXGIFactory2> factory;
-    device.As(&dxgi_device);
-    if (dxgi_device) dxgi_device->GetAdapter(&dxgi_adapter);
-    if (dxgi_adapter) dxgi_adapter->GetParent(IID_PPV_ARGS(&factory));
+    MirrorContext ctx;
+    ctx.outputs = &outputs;
+    ctx.hwnd = hwnd;
+    ctx.target_index = config.target_index;
+    ctx.source_kind = config.source_kind;
+    ctx.source_index = config.source_index;
+    ctx.window_handle = config.window_handle;
+    ctx.scale_mode = config.scale_mode;
+    ctx.vsync = config.vsync != 0;
+    ctx.capture_backend = config.capture_backend;
 
-    if (!factory) {
-        klive_set_message("获取 DXGI 工厂失败");
+    // 初始源：动态档位解析失败（例如鼠标就在目标屏上）时退回全屏档的固定源
+    int32_t want_kind = KLIVE_SOURCE_MONITOR;
+    int32_t want_index = -1;
+    int64_t want_handle = 0;
+    if (!resolve_source(ctx, initial_mode, want_kind, want_index, want_handle)) {
+        want_kind = config.source_kind;
+        want_index = config.source_index;
+        want_handle = config.window_handle;
+        // 动态档位解析失败时退回固定源，但绝不能退回目标屏自己
+        if (want_kind == KLIVE_SOURCE_MONITOR && want_index == config.target_index) {
+            want_index = -1;
+            for (const KliveOutput& output : outputs) {
+                if (output.index != config.target_index) {
+                    want_index = output.index;
+                    break;
+                }
+            }
+        }
+    }
+    if (want_kind == KLIVE_SOURCE_MONITOR && want_index < 0) {
+        klive_set_message("至少需要两台显示器");
         DestroyWindow(hwnd);
-        return KLIVE_E_DEVICE;
+        return KLIVE_E_NO_MONITOR;
     }
-    factory->MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER);
-
-    DXGI_SWAP_CHAIN_DESC1 swap_desc{};
-    swap_desc.Width = static_cast<UINT>(window_width);
-    swap_desc.Height = static_cast<UINT>(window_height);
-    swap_desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-    swap_desc.SampleDesc.Count = 1;
-    swap_desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-    swap_desc.BufferCount = 2;
-    swap_desc.Scaling = DXGI_SCALING_STRETCH;
-    swap_desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
-    swap_desc.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
-
-    ComPtr<IDXGISwapChain1> swap_chain;
-    HRESULT hr = factory->CreateSwapChainForHwnd(device.Get(), hwnd, &swap_desc, nullptr, nullptr,
-                                                 &swap_chain);
-    if (FAILED(hr)) {
-        set_dxgi_error("创建交换链", hr);
+    int32_t code = switch_source(ctx, want_kind, want_index, want_handle);
+    if (code != KLIVE_OK) {
         DestroyWindow(hwnd);
-        return KLIVE_E_DEVICE;
+        return code;
     }
-
-    ComPtr<ID3D11RenderTargetView> render_target;
-    auto recreate_render_target = [&](UINT width, UINT height) -> bool {
-        render_target.Reset();
-        if (width == 0 || height == 0) return false;
-        if (FAILED(swap_chain->ResizeBuffers(0, width, height, DXGI_FORMAT_UNKNOWN, 0))) return false;
-        ComPtr<ID3D11Texture2D> back_buffer;
-        if (FAILED(swap_chain->GetBuffer(0, IID_PPV_ARGS(&back_buffer)))) return false;
-        if (FAILED(device->CreateRenderTargetView(back_buffer.Get(), nullptr, &render_target))) return false;
-
-        D3D11_VIEWPORT viewport{};
-        viewport.Width = static_cast<float>(width);
-        viewport.Height = static_cast<float>(height);
-        viewport.MaxDepth = 1.0f;
-        context->RSSetViewports(1, &viewport);
-        return true;
-    };
-
-    if (!recreate_render_target(static_cast<UINT>(window_width), static_cast<UINT>(window_height))) {
-        klive_set_message("创建渲染目标失败");
-        DestroyWindow(hwnd);
-        return KLIVE_E_DEVICE;
-    }
-
-    Pipeline pipeline;
-    if (!pipeline.create(device.Get())) {
-        klive_set_message("初始化渲染管线失败");
-        DestroyWindow(hwnd);
-        return KLIVE_E_DEVICE;
-    }
-
-    // 采集后端：窗口只能走 WGC；显示器可选桌面复制（独占）或 WGC（共享）
-    const bool use_wgc = window_source || config.capture_backend == KLIVE_CAPTURE_WGC;
-
-    std::unique_ptr<FrameSource> frame_source;
-    if (window_source) {
-        frame_source = klive_create_wgc_window_source(
-            reinterpret_cast<HWND>(static_cast<intptr_t>(config.window_handle)), device.Get());
-    } else if (use_wgc) {
-        frame_source = klive_create_wgc_monitor_source(source.desc.Monitor, device.Get());
-    } else {
-        frame_source = klive_create_duplication_source(source, device.Get());
-    }
-    if (!frame_source) {
-        if (klive_message()[0] == '\0') klive_set_message("开启帧采集失败");
-        DestroyWindow(hwnd);
-        return window_source ? KLIVE_E_WINDOW : (use_wgc ? KLIVE_E_CAPTURE : KLIVE_E_DUPLICATION);
-    }
+    session.source_index = ctx.resolved_index;
 
     RegisterHotKey(nullptr, kHotkeyId, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'Q');
 
     int32_t result = KLIVE_OK;
     auto last_fps_sample = Clock::now();
+    auto last_probe = Clock::now() - kSourceProbeInterval;
     int64_t frames_since_sample = 0;
+    int32_t last_mode = -1;
+    // 缩放中心：鼠标离开当前源显示器时保留最后一次有效位置，避免画面跳边
+    float zoom_u = 0.5f;
+    float zoom_v = 0.5f;
     bool quit = false;
 
     while (!quit && !session.stop.load()) {
@@ -377,14 +604,52 @@ int32_t run_mirror(KliveMirrorSession& session, const klive_mirror_config& confi
 
         if (g_window.resized) {
             g_window.resized = false;
-            recreate_render_target(g_window.width, g_window.height);
+            resize_render_target(ctx);
+        }
+
+        const int32_t mode = session.mode.load();
+        const auto now = Clock::now();
+        if (mode != last_mode || now - last_probe >= kSourceProbeInterval) {
+            last_mode = mode;
+            last_probe = now;
+            if (resolve_source(ctx, mode, want_kind, want_index, want_handle)) {
+                code = switch_source(ctx, want_kind, want_index, want_handle);
+                if (code == KLIVE_E_DEVICE) {
+                    result = code;
+                    break;
+                }
+                if (code == KLIVE_OK) session.source_index = ctx.resolved_index;
+            }
+        }
+
+        if (!ctx.source) {
+            Sleep(10);
+            continue;
         }
 
         ComPtr<ID3D11Texture2D> frame_texture;
-        if (!frame_source->grab(context.Get(), frame_texture)) {
-            if (frame_source->error() != KLIVE_OK) {
-                result = frame_source->error();
+        const bool has_frame = ctx.source->grab(ctx.context.Get(), frame_texture);
+        if (ctx.source->error() != KLIVE_OK) {
+            if (mode == KLIVE_MODE_FULLSCREEN) {
+                result = ctx.source->error();
                 break;
+            }
+            // 动态源失效（窗口关闭 / WGC 会话断开）：丢掉它，下一轮重新解析
+            ctx.source.reset();
+            ctx.resolved_kind = -1;
+            ctx.resolved_index = -1;
+            ctx.resolved_window = 0;
+            ctx.clear_next = true;
+            session.source_index = -1;
+            continue;
+        }
+
+        if (!has_frame) {
+            if (ctx.clear_next && ctx.render_target) {
+                const float clear[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+                ctx.context->ClearRenderTargetView(ctx.render_target.Get(), clear);
+                ctx.swap_chain->Present(ctx.vsync ? 1 : 0, 0);
+                ctx.clear_next = false;
             }
             continue;
         }
@@ -394,58 +659,91 @@ int32_t run_mirror(KliveMirrorSession& session, const klive_mirror_config& confi
 
         const UINT swap_width = g_window.width;
         const UINT swap_height = g_window.height;
-        if (!render_target || swap_width == 0 || swap_height == 0) continue;
+        if (!ctx.render_target || swap_width == 0 || swap_height == 0) continue;
 
         float scale_x = 1.0f;
         float scale_y = 1.0f;
-        if (config.scale_mode == 0 && desc.Width > 0 && desc.Height > 0) {
+        if (ctx.scale_mode == 0 && desc.Width > 0 && desc.Height > 0) {
             const float fit = std::min(static_cast<float>(swap_width) / static_cast<float>(desc.Width),
                                        static_cast<float>(swap_height) / static_cast<float>(desc.Height));
             scale_x = static_cast<float>(desc.Width) * fit / static_cast<float>(swap_width);
             scale_y = static_cast<float>(desc.Height) * fit / static_cast<float>(swap_height);
         }
 
-        ScaleParams params{{scale_x, scale_y}, {0.0f, 0.0f}};
-        context->UpdateSubresource(pipeline.params.Get(), 0, nullptr, &params, 0, 0);
+        float uv_scale_x = 1.0f;
+        float uv_scale_y = 1.0f;
+        float uv_offset_x = 0.0f;
+        float uv_offset_y = 0.0f;
+        const int32_t zoom = zoom_factor_for_mode(mode);
+        if (zoom > 1 && ctx.resolved_kind == KLIVE_SOURCE_MONITOR && ctx.resolved_index >= 0) {
+            const RECT& source_rect =
+                outputs[static_cast<size_t>(ctx.resolved_index)].desc.DesktopCoordinates;
+            POINT cursor{};
+            GetCursorPos(&cursor);
+            const float u = static_cast<float>(cursor.x - source_rect.left) /
+                            static_cast<float>(source_rect.right - source_rect.left);
+            const float v = static_cast<float>(cursor.y - source_rect.top) /
+                            static_cast<float>(source_rect.bottom - source_rect.top);
+            if (u >= 0.0f && u <= 1.0f && v >= 0.0f && v <= 1.0f) {
+                zoom_u = u;
+                zoom_v = v;
+            }
+            const float span = 1.0f / static_cast<float>(zoom);
+            uv_scale_x = span;
+            uv_scale_y = span;
+            uv_offset_x = std::clamp(zoom_u - span * 0.5f, 0.0f, 1.0f - span);
+            uv_offset_y = std::clamp(zoom_v - span * 0.5f, 0.0f, 1.0f - span);
+        }
 
-        ID3D11ShaderResourceView* frame_view = frame_source->view();
+        ScaleParams params{{scale_x, scale_y},
+                           {uv_scale_x, uv_scale_y},
+                           {uv_offset_x, uv_offset_y},
+                           {0.0f, 0.0f}};
+        ctx.context->UpdateSubresource(ctx.pipeline.params.Get(), 0, nullptr, &params, 0, 0);
+
+        ID3D11ShaderResourceView* frame_view = ctx.source->view();
         const float clear[4] = {0.0f, 0.0f, 0.0f, 1.0f};
-        context->ClearRenderTargetView(render_target.Get(), clear);
-        context->OMSetRenderTargets(1, render_target.GetAddressOf(), nullptr);
-        context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
-        context->IASetInputLayout(nullptr);
-        context->RSSetState(pipeline.rasterizer.Get());
-        context->VSSetShader(pipeline.vertex.Get(), nullptr, 0);
-        context->VSSetConstantBuffers(0, 1, pipeline.params.GetAddressOf());
-        context->PSSetShader(pipeline.pixel.Get(), nullptr, 0);
-        context->PSSetShaderResources(0, 1, &frame_view);
-        context->PSSetSamplers(0, 1, pipeline.sampler.GetAddressOf());
-        context->Draw(4, 0);
+        ctx.context->ClearRenderTargetView(ctx.render_target.Get(), clear);
+        ctx.context->OMSetRenderTargets(1, ctx.render_target.GetAddressOf(), nullptr);
+        ctx.context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+        ctx.context->IASetInputLayout(nullptr);
+        ctx.context->RSSetState(ctx.pipeline.rasterizer.Get());
+        ctx.context->VSSetShader(ctx.pipeline.vertex.Get(), nullptr, 0);
+        ctx.context->VSSetConstantBuffers(0, 1, ctx.pipeline.params.GetAddressOf());
+        ctx.context->PSSetShader(ctx.pipeline.pixel.Get(), nullptr, 0);
+        // 像素着色器要用 gUvScale / gUvOffset 做缩放，常量缓冲必须也绑到 PS 阶段
+        ctx.context->PSSetConstantBuffers(0, 1, ctx.pipeline.params.GetAddressOf());
+        ctx.context->PSSetShaderResources(0, 1, &frame_view);
+        ctx.context->PSSetSamplers(0, 1, ctx.pipeline.sampler.GetAddressOf());
+        ctx.context->Draw(4, 0);
 
-        hr = swap_chain->Present(config.vsync ? 1 : 0, 0);
+        const HRESULT hr = ctx.swap_chain->Present(ctx.vsync ? 1 : 0, 0);
         if (FAILED(hr)) {
             set_dxgi_error("呈现画面", hr);
             result = KLIVE_E_DEVICE;
             break;
         }
+        ctx.clear_next = false;
 
         session.frames.fetch_add(1);
         session.frame_width = static_cast<int32_t>(desc.Width);
         session.frame_height = static_cast<int32_t>(desc.Height);
         ++frames_since_sample;
 
-        const auto now = Clock::now();
-        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_fps_sample);
+        const auto sample_now = Clock::now();
+        const auto elapsed =
+            std::chrono::duration_cast<std::chrono::milliseconds>(sample_now - last_fps_sample);
         if (elapsed.count() >= 500) {
             session.fps = static_cast<double>(frames_since_sample) * 1000.0 /
                           static_cast<double>(elapsed.count());
             frames_since_sample = 0;
-            last_fps_sample = now;
+            last_fps_sample = sample_now;
         }
     }
 
     UnregisterHotKey(nullptr, kHotkeyId);
     session.fps = 0.0;
+    session.source_index = -1;
     DestroyWindow(hwnd);
     return result;
 }
@@ -471,41 +769,49 @@ int32_t klive_mirror_start(const klive_mirror_config& config) {
         session.worker.join();
     }
 
+    if (config.mode < 0 || config.mode >= KLIVE_MODE_COUNT) {
+        klive_set_message("镜像档位无效");
+        return KLIVE_E_INVALID_ARG;
+    }
+
     // 先在调用线程做一次参数校验，错误可以同步返回给 UI
     std::vector<KliveOutput> outputs = klive_collect_outputs();
     if (outputs.empty()) {
         klive_set_message("没有检测到可用显示器");
         return KLIVE_E_NO_MONITOR;
     }
-    const bool window_source = config.source_kind == KLIVE_SOURCE_WINDOW;
     if (config.target_index < 0 || config.target_index >= static_cast<int32_t>(outputs.size())) {
         klive_set_message("目标显示器编号无效");
         return KLIVE_E_INVALID_ARG;
     }
-    if (window_source) {
-        if (config.window_handle == 0) {
-            klive_set_message("没有选择采集窗口");
-            return KLIVE_E_INVALID_ARG;
-        }
-    } else {
-        if (config.source_index < 0 ||
-            config.source_index >= static_cast<int32_t>(outputs.size())) {
-            klive_set_message("源显示器编号无效");
-            return KLIVE_E_INVALID_ARG;
-        }
-        if (config.source_index == config.target_index) {
-            klive_set_message("源显示器和目标显示器不能相同");
-            return KLIVE_E_INVALID_ARG;
+    if (config.mode == KLIVE_MODE_FULLSCREEN) {
+        if (config.source_kind == KLIVE_SOURCE_WINDOW) {
+            if (config.window_handle == 0) {
+                klive_set_message("没有选择采集窗口");
+                return KLIVE_E_INVALID_ARG;
+            }
+        } else {
+            if (config.source_index < 0 ||
+                config.source_index >= static_cast<int32_t>(outputs.size())) {
+                klive_set_message("源显示器编号无效");
+                return KLIVE_E_INVALID_ARG;
+            }
+            if (config.source_index == config.target_index) {
+                klive_set_message("源显示器和目标显示器不能相同");
+                return KLIVE_E_INVALID_ARG;
+            }
         }
     }
 
     session.config = config;
+    session.mode = config.mode;
     session.stop = false;
     session.last_error = KLIVE_OK;
     session.frames = 0;
     session.fps = 0.0;
     session.frame_width = 0;
     session.frame_height = 0;
+    session.source_index = -1;
     session.running = true;
 
     session.worker = std::thread([&session] {

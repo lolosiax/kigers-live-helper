@@ -1,6 +1,7 @@
 package moe.lolosia.klive.capture
 
 import moe.lolosia.klive.model.MirrorRequest
+import moe.lolosia.klive.model.MirrorSettings
 import moe.lolosia.klive.model.MirrorStats
 import moe.lolosia.klive.model.MonitorInfo
 import moe.lolosia.klive.model.WindowInfo
@@ -26,6 +27,12 @@ interface MirrorEngine {
     suspend fun stats(): MirrorStats
 
     suspend fun lastMessage(): String?
+
+    /** 读上次保存的档位与显示器选择；没有配置或读取失败返回 null。 */
+    suspend fun settings(): MirrorSettings?
+
+    /** 保存档位与显示器选择；运行中改档位会立即生效。失败静默。 */
+    suspend fun saveSettings(settings: MirrorSettings)
 
     /** 请求打开 keel 控制台窗口；成功返回 null，失败返回可展示的错误描述。 */
     suspend fun openConsole(): String?
