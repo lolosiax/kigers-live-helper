@@ -37,7 +37,7 @@ extern "C" {
 typedef struct klive_webview_config {
     const char* native_dir;     /* UTF-8：含 klive_capture.dll / klive_webview.dll / WebView2Loader.dll */
     const char* web_dir;        /* UTF-8：含 index.html 的目录 */
-    const char* user_data_dir;  /* UTF-8，可空；空则用 %LOCALAPPDATA%\klive\WebView2 */
+    const char* data_dir;       /* UTF-8：插件持久化数据目录（ctx.dataDir）；WebView2 profile 写在其下 */
     int32_t width;
     int32_t height;
     int32_t min_width;
@@ -51,13 +51,14 @@ typedef struct klive_webview_config {
     void (*open_console)(void* user_data);
     void* open_console_user;
     /*
-     * 持久化设置（UTF-8 JSON，可空）：档位 + 全屏档的源 / 目标显示器身份。
+     * 初始设置（UTF-8 JSON，可空）：档位 + 全屏档的源 / 目标显示器身份，由插件从
+     * keel 插件配置读出后传入。
      * 键：mode / sourceMonitor / sourceFriendly / targetMonitor / targetFriendly。
      */
     const char* settings_json;
     /*
-     * 设置变更回调，可空。native 在 UI 线程调用，参数是完整 JSON；
-     * 实现同样只能投递消息，不能阻塞（切档走的是低级鼠标钩子）。
+     * 设置变更回调，可空。native 在 UI 线程调用，参数是完整 JSON；实现只应投递消息，
+     * 不能阻塞（切档走的是低级鼠标钩子），落盘由插件写回 keel 配置。
      */
     void (*save_settings)(const char* json, void* user_data);
     void* save_settings_user;

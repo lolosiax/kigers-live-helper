@@ -152,71 +152,12 @@ std::wstring JoinPath(const std::wstring& directory, const std::wstring& relativ
 // ---------------------------------------------------------------------------
 // 用户数据目录
 //
-// 设置属于用户数据，不能跟着 keel 的工作根走：keelRun 会重建 build/keel-run，
-// 单文件 exe 也可能从程序目录回退到 %LOCALAPPDATA%\keel\cache（共享缓存目录）。
-// 这里统一放到 %LOCALAPPDATA%\klive，和 WebView2 的 profile 同根。
+// 目录由 keel 插件按 Host 的目录规范解析（ctx.dataDir），这里只接收结果：
+// 设置由插件写回 keel 配置，WebView2 profile 放在 data_dir 下的 WebView2/。
 // ---------------------------------------------------------------------------
 
-std::wstring DataRootDir() {
-    wchar_t buffer[MAX_PATH] = {};
-    DWORD length = GetEnvironmentVariableW(L"LOCALAPPDATA", buffer, ARRAYSIZE(buffer));
-    std::wstring root = length > 0 ? std::wstring(buffer, length) : std::wstring(L".");
-    std::wstring directory = JoinPath(root, L"klive");
-    SHCreateDirectoryExW(nullptr, directory.c_str(), nullptr);
-    return directory;
-}
-
-std::wstring SettingsFilePath() {
-    return JoinPath(DataRootDir(), L"settings.json");
-}
-
-std::string ReadFileUtf8(const std::wstring& path) {
-    HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
-                              nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (file == INVALID_HANDLE_VALUE) return {};
-
-    LARGE_INTEGER size{};
-    if (!GetFileSizeEx(file, &size) || size.QuadPart <= 0 || size.QuadPart > 1024 * 1024) {
-        CloseHandle(file);
-        return {};
-    }
-
-    std::string text(static_cast<size_t>(size.QuadPart), '\0');
-    DWORD read = 0;
-    const BOOL ok = ReadFile(file, text.data(), static_cast<DWORD>(text.size()), &read, nullptr);
-    CloseHandle(file);
-    if (!ok) return {};
-    text.resize(read);
-    return text;
-}
-
-/* 先写 .tmp 再原子替换，避免掉电 / 崩溃留下半截 JSON。 */
-bool WriteFileUtf8(const std::wstring& path, const std::string& text) {
-    const std::wstring temporary = path + L".tmp";
-    HANDLE file = CreateFileW(temporary.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
-                              FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (file == INVALID_HANDLE_VALUE) return false;
-
-    DWORD written = 0;
-    const BOOL ok =
-        WriteFile(file, text.data(), static_cast<DWORD>(text.size()), &written, nullptr);
-    CloseHandle(file);
-    if (!ok || written != text.size()) {
-        DeleteFileW(temporary.c_str());
-        return false;
-    }
-    if (!MoveFileExW(temporary.c_str(), path.c_str(),
-                     MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
-        DeleteFileW(temporary.c_str());
-        return false;
-    }
-    return true;
-}
-
-/**
- * `LoadLibraryExW` 的 `LOAD_LIBRARY_SEARCH_*` 只接受绝对路径；
- * Host 传进来的物化目录可能是相对路径（取决于 `--plugins` 参数）。
- */
+/** `LoadLibraryExW` 的 `LOAD_LIBRARY_SEARCH_*` 只接受绝对路径；
+ *  Host 传进来的物化目录可能是相对路径（取决于 `--plugins` 参数）。 */
 std::wstring AbsolutePath(const std::wstring& path) {
     DWORD required = GetFullPathNameW(path.c_str(), 0, nullptr, nullptr);
     if (required == 0) return path;
@@ -317,7 +258,7 @@ std::thread g_thread;
 struct UiContext {
     std::wstring native_dir;
     std::wstring web_dir;
-    std::wstring user_data_dir;
+    std::wstring data_dir;
     int width = 1120;
     int height = 760;
     int min_width = 920;
@@ -669,16 +610,9 @@ std::string SettingsJson() {
 }
 
 void SaveSettings() {
-    const std::string text = SettingsJson();
-    const std::wstring path = SettingsFilePath();
-    if (WriteFileUtf8(path, text)) {
-        Log("[webview] 设置已写入：%s", WideToUtf8(path).c_str());
-    } else {
-        Log("[webview] 设置写入失败：%s", WideToUtf8(path).c_str());
-    }
-    // 兼容 keel 插件配置：Host 侧仍保留一份镜像，读不到用户目录时还能恢复
+    // 落盘由插件写回 keel 配置；这里只把最新 JSON 交出去。
     if (g_ui != nullptr && g_ui->save_settings != nullptr) {
-        g_ui->save_settings(text.c_str(), g_ui->save_settings_user);
+        g_ui->save_settings(SettingsJson().c_str(), g_ui->save_settings_user);
     }
 }
 
@@ -1115,8 +1049,10 @@ void ConfigureWebView(UiContext* context) {
 }
 
 void CreateWebView(UiContext* context) {
+    const std::wstring profile_dir = JoinPath(context->data_dir, L"WebView2");
+    SHCreateDirectoryExW(nullptr, profile_dir.c_str(), nullptr);
     HRESULT hr = CreateCoreWebView2EnvironmentWithOptions(
-        nullptr, context->user_data_dir.c_str(), nullptr,
+        nullptr, profile_dir.c_str(), nullptr,
         Callback<ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler>(
             [context](HRESULT result, ICoreWebView2Environment* environment) -> HRESULT {
                 if (FAILED(result) || environment == nullptr) {
@@ -1387,12 +1323,6 @@ void UiThreadMain(UiContext* context) {
     }
 }
 
-std::wstring DefaultUserDataDir() {
-    std::wstring directory = JoinPath(DataRootDir(), L"WebView2");
-    SHCreateDirectoryExW(nullptr, directory.c_str(), nullptr);
-    return directory;
-}
-
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -1404,6 +1334,10 @@ extern "C" {
 int32_t klive_webview_start(const klive_webview_config* config) {
     if (config == nullptr || config->native_dir == nullptr || config->web_dir == nullptr) {
         SetError("参数无效：native_dir / web_dir 不能为空");
+        return KLIVE_WEBVIEW_E_INVALID_ARG;
+    }
+    if (config->data_dir == nullptr || *config->data_dir == '\0') {
+        SetError("参数无效：data_dir 不能为空");
         return KLIVE_WEBVIEW_E_INVALID_ARG;
     }
 
@@ -1421,10 +1355,7 @@ int32_t klive_webview_start(const klive_webview_config* config) {
     auto* context = new UiContext();
     context->native_dir = AbsolutePath(Utf8ToWide(config->native_dir));
     context->web_dir = AbsolutePath(Utf8ToWide(config->web_dir));
-    context->user_data_dir =
-        config->user_data_dir != nullptr && *config->user_data_dir != '\0'
-            ? Utf8ToWide(config->user_data_dir)
-            : DefaultUserDataDir();
+    context->data_dir = AbsolutePath(Utf8ToWide(config->data_dir));
     context->width = config->width > 0 ? config->width : 1120;
     context->height = config->height > 0 ? config->height : 760;
     context->min_width = config->min_width > 0 ? config->min_width : 920;
@@ -1441,14 +1372,8 @@ int32_t klive_webview_start(const klive_webview_config* config) {
         delete context;
         return KLIVE_WEBVIEW_E_CAPTURE;
     }
-    // 用户目录优先；没有时才用 keel 插件配置做首次迁移的种子
-    const std::string stored = ReadFileUtf8(SettingsFilePath());
-    if (!stored.empty()) {
-        Log("[webview] 读取用户设置：%s", WideToUtf8(SettingsFilePath()).c_str());
-        ApplySettingsJson(stored.c_str());
-    } else {
-        ApplySettingsJson(context->settings_json.c_str());
-    }
+    // 设置由插件从 keel 配置读出后传入，原生不再自己落盘
+    ApplySettingsJson(context->settings_json.c_str());
 
     std::future<int32_t> init_result = context->init.get_future();
     g_exit_process.store(false);

@@ -40,13 +40,14 @@ internal class WebViewShell private constructor(
     fun start(
         nativeDir: String,
         webDir: String,
+        dataDir: String,
         devtools: Boolean,
         settingsJson: String,
     ): Int = memScoped {
         val config = alloc<klive_webview_config>()
         config.native_dir = nativeDir.cstr.ptr
         config.web_dir = webDir.cstr.ptr
-        config.user_data_dir = null
+        config.data_dir = dataDir.cstr.ptr
         config.width = 1120
         config.height = 760
         config.min_width = 920

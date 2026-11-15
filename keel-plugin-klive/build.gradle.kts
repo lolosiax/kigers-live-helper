@@ -1,3 +1,5 @@
+import moe.lolosia.keel.gradle.plugin.KeelDataMode
+
 plugins {
     alias(libs.plugins.kotlinMultiplatform)
     alias(libs.plugins.kotlinSerialization)
@@ -18,7 +20,10 @@ keelPlugin {
     executable {
         enabled = true
         name = "KigerLiveHelper"
-        // 桌面应用：GUI 子系统，双击不弹控制台；日志与命令走「打开终端」的 console 插件
+        // 桌面应用：数据根默认落到 %LOCALAPPDATA%\klive，不依赖安装目录可写
+        dataMode = KeelDataMode.USERDATA
+        appId = "klive"
+        // GUI 子系统，双击不弹控制台；日志与命令走「打开终端」的 console 插件
         console = false
         // 出包用 release：插件走 keelPackageRelease，launcher 走 keel-launcher-<target>
         buildType = "RELEASE"

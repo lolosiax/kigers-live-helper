@@ -111,10 +111,13 @@ doc/                    长任务记忆与设计材料
   - 宽字段（`int64_t` / `double`）放在结构体开头，避免中间出现隐式 padding。
   - 当前尺寸（对方改了必须同步）：`klive_monitor_desc` = 292、`klive_window_desc` = 376、
     `klive_mirror_config` = 40、`klive_mirror_stats` = 40。
-  - `klive_webview_config` 尾部追加了 `settings_json` / `save_settings` / `save_settings_user`；
-    这是破坏性变更，改完必须重编原生 DLL、keel 插件与 `klive_webview_smoke`。
-- 持久化设置属于用户数据，落盘在 `%LOCALAPPDATA%\klive\settings.json`；
-  keel 插件配置只做镜像 / 首次迁移种子，不能作为唯一来源（`keelRun` 会清空运行目录）。
+  - `klive_webview_config` 的 `data_dir`（由插件传 `ctx.dataDir`）与尾部
+    `settings_json` / `save_settings` / `save_settings_user` 都是破坏性变更，
+    改完必须重编原生 DLL、keel 插件与 `klive_webview_smoke`。
+- 目录规范跟随 keel，不自己找用户目录：镜像设置写 keel 插件配置
+  `config/plugins/klive.yaml`（`ctx.config`），原生只经 `settings_json` / `save_settings`
+  与插件交换；WebView2 profile 放 `ctx.dataDir\WebView2`。单 exe 在 Gradle 里设
+  `dataMode = KeelDataMode.USERDATA`、`appId = "klive"`，数据根落在 `%LOCALAPPDATA%\klive`。
 - 字符串字段是**定长 `char[]` + UTF-8**，不是指针；桥里转成普通字符串。
 - 错误一律走「返回码 + `klive_last_message()`」：返回码给程序判断，message 给人看。
   新增错误码要同时补桥里的错误文案。

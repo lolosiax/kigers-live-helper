@@ -53,6 +53,7 @@ class KlivePlugin : Plugin {
         val code = loaded.start(
             nativeDir = nativeDir,
             webDir = webDir,
+            dataDir = context.dataDir,
             devtools = true,
             settingsJson = Json.encodeToString(MirrorSettings.serializer(), settings),
         )

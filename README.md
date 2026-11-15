@@ -117,7 +117,7 @@ CPU 不参与像素搬运。目标显示器挂在另一块显卡时由 DWM 负�
 
 ### 运行
 
-单 exe 内嵌控制面板、原生 DLL 与 `keel-plugin-console`，双击即可运行。首次运行会在 exe 同目录创建 `plugins/` 与 `.cache/`；目录不可写时自动回退到用户缓存目录。
+单 exe 内嵌控制面板、原生 DLL 与 `keel-plugin-console`，双击即可运行。单 exe 用 `dataMode = USERDATA`，数据根默认在 `%LOCALAPPDATA%\klive`（`config/`、`data/`、`logs/`、`.cache/`）；可用 `KEEL_DATA_HOME` / `KEEL_CACHE_HOME` 重定向。
 
 只调面板布局时可以直接在浏览器里跑（Mock 引擎，不碰原生层）：
 
@@ -135,7 +135,7 @@ CPU 不参与像素搬运。目标显示器挂在另一块显卡时由 DWM 负�
 6. 页头「打开终端」打开控制台窗口，可查看日志、执行 `help` / `plugins` 等 Host 命令。
 7. 关闭面板只会缩到托盘；托盘菜单可以「显示面板 / 停止镜像 / 退出」。
 
-档位与全屏档的源 / 目标显示器存在用户数据目录 `%LOCALAPPDATA%\klive\settings.json`，下次启动自动恢复。keel 的 `config/plugins/klive.yaml` 只作为镜像/迁移种子，不作为唯一来源。
+档位与全屏档的源 / 目标显示器存在 keel 插件配置 `config/plugins/klive.yaml`（单 exe 下即 `%LOCALAPPDATA%\klive\config\plugins\klive.yaml`），下次启动自动恢复；WebView2 profile 在 `data/klive/WebView2/`。
 
 ## 构建任务
 

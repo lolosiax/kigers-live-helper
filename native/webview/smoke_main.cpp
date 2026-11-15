@@ -45,6 +45,7 @@ int wmain(int argc, wchar_t** argv) {
     std::wstring exe_dir = ExeDirectory();
     std::wstring dll_path = exe_dir + L"\\klive_webview.dll";
     std::wstring web_dir = exe_dir + L"\\smoke";
+    std::wstring data_dir = exe_dir + L"\\smoke-data";
     DWORD exit_after = 0;
 
     for (int i = 1; i < argc; ++i) {
@@ -79,9 +80,10 @@ int wmain(int argc, wchar_t** argv) {
     klive_webview_config config{};
     std::string native_dir = ToUtf8(exe_dir);
     std::string web_path = ToUtf8(web_dir);
+    std::string data_path = ToUtf8(data_dir);
     config.native_dir = native_dir.c_str();
     config.web_dir = web_path.c_str();
-    config.user_data_dir = nullptr;
+    config.data_dir = data_path.c_str();
     config.width = 900;
     config.height = 640;
     config.min_width = 640;
