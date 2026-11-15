@@ -182,6 +182,8 @@ struct CaptureApi {
     int32_t (*is_running)() = nullptr;
     int32_t (*set_mode)(int32_t) = nullptr;
     int32_t (*get_mode)() = nullptr;
+    /* HDR 色调曲线；老 DLL 没有这个导出，允许为空 */
+    int32_t (*set_tone_curve)(const float*, int32_t) = nullptr;
     void (*get_stats)(klive_mirror_stats*) = nullptr;
     const char* (*last_message)() = nullptr;
     void (*shutdown)() = nullptr;
@@ -218,6 +220,8 @@ bool LoadCaptureApi(const std::wstring& native_dir) {
     g_api.is_running = reinterpret_cast<decltype(g_api.is_running)>(resolve("klive_is_running"));
     g_api.set_mode = reinterpret_cast<decltype(g_api.set_mode)>(resolve("klive_set_mode"));
     g_api.get_mode = reinterpret_cast<decltype(g_api.get_mode)>(resolve("klive_get_mode"));
+    g_api.set_tone_curve =
+        reinterpret_cast<decltype(g_api.set_tone_curve)>(resolve("klive_set_tone_curve"));
     g_api.get_stats = reinterpret_cast<decltype(g_api.get_stats)>(resolve("klive_get_stats"));
     g_api.last_message =
         reinterpret_cast<decltype(g_api.last_message)>(resolve("klive_last_message"));
@@ -305,39 +309,6 @@ void FillTrayData(NOTIFYICONDATAW& data, HWND hwnd) {
     data.uCallbackMessage = kWmTray;
     data.hIcon = g_icon != nullptr ? g_icon : LoadIconW(nullptr, IDI_APPLICATION);
     lstrcpynW(data.szTip, L"Kiger\u76f4\u64ad\u52a9\u624b", ARRAYSIZE(data.szTip));
-}
-
-const wchar_t* ModeLabel(int32_t mode) {
-    switch (mode) {
-        case KLIVE_MODE_POINTER_MONITOR:
-            return L"\u8ddf\u968f\u9f20\u6807\u5c4f\u5e55";
-        case KLIVE_MODE_POINTER_WINDOW:
-            return L"\u9f20\u6807\u4e0b\u7a97\u53e3";
-        case KLIVE_MODE_FOCUS_WINDOW:
-            return L"\u524d\u53f0\u7a97\u53e3";
-        case KLIVE_MODE_ZOOM_2X:
-            return L"2\u00d7 \u7f29\u653e";
-        case KLIVE_MODE_ZOOM_3X:
-            return L"3\u00d7 \u7f29\u653e";
-        case KLIVE_MODE_ZOOM_4X:
-            return L"4\u00d7 \u7f29\u653e";
-        default:
-            return L"\u5168\u5c4f\u955c\u50cf";
-    }
-}
-
-/* 侧键切档后给一条托盘气泡：镜像窗口在另一块屏上时面板通常看不到。 */
-void ShowTrayInfo(const wchar_t* title, const wchar_t* text) {
-    if (g_tray_hwnd == nullptr) return;
-    NOTIFYICONDATAW data{};
-    data.cbSize = sizeof(data);
-    data.hWnd = g_tray_hwnd;
-    data.uID = kTrayIconId;
-    data.uFlags = NIF_INFO;
-    data.dwInfoFlags = NIIF_NONE;
-    lstrcpynW(data.szInfoTitle, title, ARRAYSIZE(data.szInfoTitle));
-    lstrcpynW(data.szInfo, text, ARRAYSIZE(data.szInfo));
-    Shell_NotifyIconW(NIM_MODIFY, &data);
 }
 
 void AddTrayIcon(HWND hwnd) {
@@ -494,6 +465,7 @@ json BuildMonitors() {
             {"adapterLuidLow", item.adapter_luid_low},
             {"adapterLuidHigh", item.adapter_luid_high},
             {"refreshHz", item.refresh_hz},
+            {"hdr", item.hdr != 0},
         });
     }
     return array;
@@ -532,9 +504,17 @@ struct MirrorSettings {
     std::string source_friendly;
     std::string target_monitor;
     std::string target_friendly;
+    /* 色调曲线控制点的纵坐标（横坐标固定在 TONE_CURVE_KNOTS），只负责来回传递 */
+    std::vector<float> tone_curve;
     int32_t source_index = -1;
     int32_t target_index = -1;
 };
+
+/*
+ * 默认曲线控制点：0 → 0.35 → 0.7 直通，0.9 起 shoulder，1.2 / 1.5 压到 SDR 白附近。
+ * 与 core 的 ToneCurve.Default 保持一致；面板启动后会用完整 LUT 覆盖。
+ */
+std::vector<float> DefaultToneCurve() { return {0.0f, 0.35f, 0.7f, 0.9f, 0.975f, 0.9857f}; }
 
 MirrorSettings g_settings;
 
@@ -570,14 +550,24 @@ void ApplySettingsJson(const char* text) {
             g_settings.source_friendly = value.value("sourceFriendly", std::string());
             g_settings.target_monitor = value.value("targetMonitor", std::string());
             g_settings.target_friendly = value.value("targetFriendly", std::string());
+            if (value.contains("toneCurve") && value["toneCurve"].is_array()) {
+                g_settings.tone_curve.clear();
+                for (const json& item : value["toneCurve"]) {
+                    if (item.is_number()) {
+                        g_settings.tone_curve.push_back(
+                            std::clamp(item.get<float>(), 0.0f, 1.0f));
+                    }
+                }
+            }
         } catch (const std::exception& error) {
             Log("[webview] settings json 无法解析：%s", error.what());
         }
     }
     if (g_settings.mode < 0 || g_settings.mode >= KLIVE_MODE_COUNT) g_settings.mode = 0;
+    if (g_settings.tone_curve.empty()) g_settings.tone_curve = DefaultToneCurve();
     ResolveSettingsMonitors();
-    Log("[webview] settings: mode=%d source=%d target=%d", g_settings.mode, g_settings.source_index,
-        g_settings.target_index);
+    Log("[webview] settings: mode=%d source=%d target=%d curvePoints=%zu", g_settings.mode,
+        g_settings.source_index, g_settings.target_index, g_settings.tone_curve.size());
 }
 
 /* source_index < 0 表示保留原来的源（例如用窗口做全屏镜像时）。 */
@@ -605,6 +595,7 @@ std::string SettingsJson() {
         {"sourceFriendly", g_settings.source_friendly},
         {"targetMonitor", g_settings.target_monitor},
         {"targetFriendly", g_settings.target_friendly},
+        {"toneCurve", g_settings.tone_curve},
     }
         .dump();
 }
@@ -622,6 +613,7 @@ json BuildSettingsInfo() {
         {"mode", g_settings.mode},
         {"sourceIndex", g_settings.source_index},
         {"targetIndex", g_settings.target_index},
+        {"toneCurve", g_settings.tone_curve},
     };
 }
 
@@ -662,6 +654,31 @@ json Dispatch(const std::string& method, const json& params) {
     if (method == "getSettings") {
         return BuildSettingsInfo();
     }
+    if (method == "setToneCurve") {
+        // 拖曲线时只改运行参数，不落盘；关闭弹窗后由面板调 saveSettings 持久化
+        if (!params.contains("lut") || !params["lut"].is_array()) {
+            throw BridgeError{KLIVE_WEBVIEW_E_INVALID_ARG, "色调曲线缺少 lut 数组"};
+        }
+        std::vector<float> lut;
+        lut.reserve(params["lut"].size());
+        for (const json& item : params["lut"]) {
+            if (!item.is_number()) {
+                throw BridgeError{KLIVE_WEBVIEW_E_INVALID_ARG, "色调曲线只能包含数字"};
+            }
+            lut.push_back(item.get<float>());
+        }
+        if (lut.size() != KLIVE_TONE_CURVE_SIZE) {
+            throw BridgeError{KLIVE_WEBVIEW_E_INVALID_ARG,
+                              "色调曲线必须包含 " + std::to_string(KLIVE_TONE_CURVE_SIZE) +
+                                  " 个采样点"};
+        }
+        if (g_api.set_tone_curve != nullptr && g_api.set_tone_curve(lut.data(),
+                                                                    static_cast<int32_t>(lut.size())) != 0) {
+            throw BridgeError{KLIVE_WEBVIEW_E_INVALID_ARG, CaptureMessage()};
+        }
+        Log("[webview] tone curve updated (%zu points)", lut.size());
+        return nullptr;
+    }
     if (method == "saveSettings") {
         const int32_t mode = params.value("mode", g_settings.mode);
         if (mode < 0 || mode >= KLIVE_MODE_COUNT) {
@@ -670,11 +687,18 @@ json Dispatch(const std::string& method, const json& params) {
         const int32_t source_index = params.value("sourceIndex", g_settings.source_index);
         const int32_t target_index = params.value("targetIndex", g_settings.target_index);
         UpdateSettings(mode, source_index, target_index);
+        if (params.contains("toneCurve") && params["toneCurve"].is_array()) {
+            std::vector<float> curve;
+            for (const json& item : params["toneCurve"]) {
+                if (item.is_number()) curve.push_back(std::clamp(item.get<float>(), 0.0f, 1.0f));
+            }
+            if (!curve.empty()) g_settings.tone_curve = std::move(curve);
+        }
         // 运行中改档位立即生效；未运行时只是记下下次启动的默认值
         g_api.set_mode(mode);
         SaveSettings();
-        Log("[webview] settings saved: mode=%d source=%d target=%d", mode, source_index,
-            target_index);
+        Log("[webview] settings saved: mode=%d source=%d target=%d curvePoints=%zu", mode,
+            source_index, target_index, g_settings.tone_curve.size());
         return nullptr;
     }
     if (method == "lastMessage") {
@@ -1146,7 +1170,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpara
             if (g_api.set_mode(next) != 0) return 0;
             g_settings.mode = next;
             SaveSettings();
-            ShowTrayInfo(L"Kiger\u76f4\u64ad\u52a9\u624b", ModeLabel(next));
+            // 切档提示由 klive_capture 的镜像渲染循环画到画面左上角，这里不再弹系统气泡
             Log("[webview] mode -> %d", next);
             return 0;
         }

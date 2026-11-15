@@ -20,6 +20,8 @@ data class MonitorInfo(
     val adapterLuidLow: Int,
     val adapterLuidHigh: Int,
     val refreshHz: Float,
+    /** 输出处于 HDR 模式：采集走 FP16 帧池并在着色器里做色调映射。 */
+    val hdr: Boolean = false,
 ) {
     /** 显卡标识：跨显卡的两台显示器无法直接用 D3D11 交换链呈现。 */
     val adapterKey: Long
@@ -85,6 +87,8 @@ data class MirrorSettings(
     val mode: MirrorMode = MirrorMode.Fullscreen,
     val sourceIndex: Int? = null,
     val targetIndex: Int? = null,
+    /** HDR 色调曲线的控制点纵坐标，横坐标见 [ToneCurve.Knots]。 */
+    val toneCurve: List<Float> = ToneCurve.DefaultValues,
 )
 
 /** 一个可采集的顶层窗口，由原生层 klive_window_desc 转换而来。 */

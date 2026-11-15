@@ -109,7 +109,7 @@ doc/                    长任务记忆与设计材料
   - 不放 4 字节以下的字段（`bool` / `short` 一律用 `int32_t`）；
   - **总大小保持 8 的整数倍**，必要时用 `int32_t reserved` 补齐；
   - 宽字段（`int64_t` / `double`）放在结构体开头，避免中间出现隐式 padding。
-  - 当前尺寸（对方改了必须同步）：`klive_monitor_desc` = 292、`klive_window_desc` = 376、
+  - 当前尺寸（对方改了必须同步）：`klive_monitor_desc` = 296、`klive_window_desc` = 376、
     `klive_mirror_config` = 40、`klive_mirror_stats` = 40。
   - `klive_webview_config` 的 `data_dir`（由插件传 `ctx.dataDir`）与尾部
     `settings_json` / `save_settings` / `save_settings_user` 都是破坏性变更，
@@ -153,6 +153,14 @@ doc/                    长任务记忆与设计材料
 - 换卡重建时必须**先释放旧视图 / 交换链，再 `ClearState` + `Flush`**，最后才
   `CreateSwapChainForHwnd`：一个 HWND 同时只能挂一个 flip 交换链，D3D11 的延迟销毁
   会让顺序反过来的重建报 `E_ACCESSDENIED`。
+- **HDR 输出**：用 `IDXGIOutput6::GetDesc1().ColorSpace` 判断，HDR 屏一律走 WGC 的
+  `R16G16B16A16_FLOAT` 帧池（scRGB 线性，1.0 = 80 nits），按 `GET_SDR_WHITE_LEVEL`
+  归一化 SDR 白后再查色调曲线 + sRGB 编码。不要用 BGRA8 帧池（系统压出来的高光会
+  裁白），也不要用桌面复制（HDR 下表面颜色编码不可靠）。
+- **HDR 色调曲线**：`klive_set_tone_curve` 接收 65 点线性 LUT（输入 0..2，输出 0..1），
+  原生层存进 `Texture1D`，着色器按线性采样；面板在 HDR 显示器行给出「···」入口，
+  用 6 个控制点拖曲线，LUT 由 `core` 的 `ToneCurve.lut()` 生成。曲线变化时渲染循环
+  主动补一帧，静态画面也能立刻看到效果。
 - 全屏四边形的固定要求（回退就会黑屏）：`D3D11_CULL_NONE` 光栅化状态 + 显式 `viewport` +
   flip 模型交换链（`DXGI_SWAP_EFFECT_FLIP_DISCARD`）。
 - 采集失败要有可读原因：`klive_set_dxgi_error` 已覆盖常见的 `DXGI_ERROR_*`，
@@ -180,6 +188,7 @@ native/src/internal.h                内部共享：显示器枚举结果、会�
 native/src/klive_exports.cpp         导出函数实现（枚举 / 启动 / 停止 / 统计 / 消息）
 native/src/klive_monitor.cpp         显示器与窗口枚举、错误消息缓冲
 native/src/klive_mirror.cpp          镜像窗口 + 渲染循环 + 缩放 + Present + 帧率统计
+native/src/klive_osd.h/.cpp          镜像左上角 OSD：GDI 文字位图 → 预乘 alpha 贴图叠加
 native/src/frame_source.h/.cpp       FrameSource 抽象、FrameCopy 中转纹理、DXGI 错误文案
 native/src/klive_duplication.cpp     桌面复制后端
 native/src/klive_wgc.cpp             WGC 后端（C++/WinRT，显示器 + 窗口）

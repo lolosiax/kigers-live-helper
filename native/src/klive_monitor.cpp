@@ -1,6 +1,7 @@
 #include "internal.h"
 
 #include <dwmapi.h>
+#include <dxgi1_6.h>
 
 #include <cstdarg>
 #include <cstdio>
@@ -109,6 +110,62 @@ const char* klive_message() {
     return g_message;
 }
 
+/**
+ * 是否为 HDR 输出。
+ *
+ * DXGI 用 colorSpace 描述桌面合成格式：PQ/P2020（HDR10）与 scRGB 线性都算 HDR，
+ * 其余（sRGB / P2020 SDR）按普通 SDR 处理。
+ */
+bool is_hdr_color_space(DXGI_COLOR_SPACE_TYPE space) {
+    return space == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020 ||
+           space == DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709;
+}
+
+/**
+ * HDR 模式下系统设定的 SDR 白电平（nits）。
+ *
+ * Auto HDR / HDR 桌面把 SDR 内容按这个亮度映射进 HDR 域，色调映射必须用同一个
+ * 基准把 SDR 白还原成 1.0，否则整幅画面会整体偏亮或偏暗。
+ * 旧系统没有 GET_SDR_WHITE_LEVEL 时按 200 nits 估计（Windows 常见默认值）。
+ */
+float query_sdr_white_nits(const wchar_t* device_name) {
+    constexpr float kFallbackNits = 200.0f;
+
+    UINT32 path_count = 0;
+    UINT32 mode_count = 0;
+    if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &path_count, &mode_count) != ERROR_SUCCESS) {
+        return kFallbackNits;
+    }
+    std::vector<DISPLAYCONFIG_PATH_INFO> paths(path_count);
+    std::vector<DISPLAYCONFIG_MODE_INFO> modes(mode_count);
+    if (QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &path_count, paths.data(), &mode_count,
+                           modes.data(), nullptr) != ERROR_SUCCESS) {
+        return kFallbackNits;
+    }
+
+    for (UINT32 i = 0; i < path_count; ++i) {
+        DISPLAYCONFIG_SOURCE_DEVICE_NAME source{};
+        source.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+        source.header.size = sizeof(source);
+        source.header.adapterId = paths[i].sourceInfo.adapterId;
+        source.header.id = paths[i].sourceInfo.id;
+        if (DisplayConfigGetDeviceInfo(&source.header) != ERROR_SUCCESS) continue;
+        if (wcscmp(source.viewGdiDeviceName, device_name) != 0) continue;
+
+        DISPLAYCONFIG_SDR_WHITE_LEVEL white{};
+        white.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL;
+        white.header.size = sizeof(white);
+        white.header.adapterId = paths[i].targetInfo.adapterId;
+        white.header.id = paths[i].targetInfo.id;
+        if (DisplayConfigGetDeviceInfo(&white.header) != ERROR_SUCCESS || white.SDRWhiteLevel == 0) {
+            return kFallbackNits;
+        }
+        // SDRWhiteLevel 以 1/1000 为单位，1000 对应 80 nits
+        return static_cast<float>(white.SDRWhiteLevel) / 1000.0f * 80.0f;
+    }
+    return kFallbackNits;
+}
+
 std::vector<KliveOutput> klive_collect_outputs() {
     std::vector<KliveOutput> outputs;
 
@@ -146,6 +203,18 @@ std::vector<KliveOutput> klive_collect_outputs() {
             if (EnumDisplaySettingsW(desc.DeviceName, ENUM_CURRENT_SETTINGS, &mode) &&
                 mode.dmDisplayFrequency >= 20) {
                 entry.refresh_hz = static_cast<float>(mode.dmDisplayFrequency);
+            }
+
+            ComPtr<IDXGIOutput6> output6;
+            if (SUCCEEDED(output.As(&output6))) {
+                DXGI_OUTPUT_DESC1 desc1{};
+                if (SUCCEEDED(output6->GetDesc1(&desc1))) {
+                    entry.hdr = is_hdr_color_space(desc1.ColorSpace);
+                    entry.max_luminance = desc1.MaxLuminance;
+                }
+            }
+            if (entry.hdr) {
+                entry.sdr_white_nits = query_sdr_white_nits(desc.DeviceName);
             }
 
             utf8_from_wide(desc.DeviceName, entry.name, sizeof(entry.name));

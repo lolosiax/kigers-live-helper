@@ -1,5 +1,6 @@
 #include "internal.h"
 #include "frame_source.h"
+#include "klive_osd.h"
 
 #include <d3d11.h>
 #include <d3dcompiler.h>
@@ -17,16 +18,39 @@ constexpr wchar_t kWindowClass[] = L"KliveMirrorWindow";
 constexpr int kHotkeyId = 0xC1;
 /* 动态档位重新解析采集源的间隔：太短会把设备重建拖成抖动，太长跟随会迟钝。 */
 constexpr auto kSourceProbeInterval = std::chrono::milliseconds(250);
+/* 切档提示在镜像画面上停留多久；太长会挡住画面，太短来不及扫一眼。 */
+constexpr auto kOsdDuration = std::chrono::milliseconds(1800);
+
+/* OSD 文案：镜像窗口在另一块屏上时，面板与系统通知都可能看不到。 */
+const wchar_t* mode_label(int32_t mode) {
+    switch (mode) {
+        case KLIVE_MODE_POINTER_MONITOR:
+            return L"\u8ddf\u968f\u9f20\u6807\u5c4f\u5e55";
+        case KLIVE_MODE_POINTER_WINDOW:
+            return L"\u9f20\u6807\u4e0b\u7a97\u53e3";
+        case KLIVE_MODE_FOCUS_WINDOW:
+            return L"\u524d\u53f0\u7a97\u53e3";
+        case KLIVE_MODE_ZOOM_2X:
+            return L"2\u00d7 \u7f29\u653e";
+        case KLIVE_MODE_ZOOM_3X:
+            return L"3\u00d7 \u7f29\u653e";
+        case KLIVE_MODE_ZOOM_4X:
+            return L"4\u00d7 \u7f29\u653e";
+        default:
+            return L"\u5168\u5c4f\u955c\u50cf";
+    }
+}
 
 const char* kShaderSource = R"(
 cbuffer Params : register(b0) {
     float2 gScale;    // 四边形缩放，负责等比填充 / 拉伸铺满
     float2 gUvScale;  // 采样范围，缩放档位时 = 1/倍数
     float2 gUvOffset; // 采样起点，按鼠标位置居中后夹取到边缘内
-    float2 gPad;
+    float2 gHdr;      // x = 1 表示输入是 scRGB 线性帧；y = SDR 白电平（scRGB 单位）
 };
 
 Texture2D gSource : register(t0);
+Texture1D gToneCurve : register(t1);
 SamplerState gSampler : register(s0);
 
 struct VSOut {
@@ -43,8 +67,30 @@ VSOut VSMain(uint id : SV_VertexID) {
     return o;
 }
 
+float3 LinearToSrgb(float3 c) {
+    c = saturate(c);
+    return c <= 0.0031308 ? c * 12.92 : 1.055 * pow(c, 1.0 / 2.4) - 0.055;
+}
+
+/*
+ * HDR → SDR：输入是 WGC 的 scRGB 线性帧（1.0 = 80 nits）。
+ * 先按系统 SDR 白电平归一化，再用面板给出的色调曲线（0..2 线性输入 → 0..1 线性输出）
+ * 查表，最后 sRGB 编码。曲线纹理由 CPU 端单调三次插值生成，默认是 0.9 起的 C1 shoulder。
+ */
+float3 HdrToSdr(float3 c) {
+    c = max(c, 0.0) / max(gHdr.y, 1e-3);
+    float3 t = saturate(c * 0.5);
+    float3 mapped = float3(
+        gToneCurve.SampleLevel(gSampler, t.x, 0).r,
+        gToneCurve.SampleLevel(gSampler, t.y, 0).r,
+        gToneCurve.SampleLevel(gSampler, t.z, 0).r);
+    return LinearToSrgb(mapped);
+}
+
 float4 PSMain(VSOut i) : SV_TARGET {
-    return gSource.Sample(gSampler, i.uv * gUvScale + gUvOffset);
+    float4 color = gSource.Sample(gSampler, i.uv * gUvScale + gUvOffset);
+    if (gHdr.x > 0.5) return float4(HdrToSdr(color.rgb), 1.0);
+    return color;
 }
 )";
 
@@ -52,7 +98,7 @@ struct ScaleParams {
     float scale[2];
     float uv_scale[2];
     float uv_offset[2];
-    float pad[2];
+    float hdr[2];
 };
 
 struct Pipeline {
@@ -61,6 +107,8 @@ struct Pipeline {
     ComPtr<ID3D11SamplerState> sampler;
     ComPtr<ID3D11Buffer> params;
     ComPtr<ID3D11RasterizerState> rasterizer;
+    ComPtr<ID3D11Texture1D> curve_texture;
+    ComPtr<ID3D11ShaderResourceView> curve_view;
 
     void reset() {
         vertex.Reset();
@@ -68,6 +116,8 @@ struct Pipeline {
         sampler.Reset();
         params.Reset();
         rasterizer.Reset();
+        curve_texture.Reset();
+        curve_view.Reset();
     }
 
     bool create(ID3D11Device* device) {
@@ -131,7 +181,29 @@ struct Pipeline {
             klive_set_message("创建光栅化状态失败");
             return false;
         }
+
+        float curve[KLIVE_TONE_CURVE_SIZE];
+        klive_default_tone_curve(curve);
+        D3D11_TEXTURE1D_DESC curve_desc{};
+        curve_desc.Width = KLIVE_TONE_CURVE_SIZE;
+        curve_desc.MipLevels = 1;
+        curve_desc.ArraySize = 1;
+        curve_desc.Format = DXGI_FORMAT_R32_FLOAT;
+        curve_desc.Usage = D3D11_USAGE_DEFAULT;
+        curve_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        D3D11_SUBRESOURCE_DATA curve_data{};
+        curve_data.pSysMem = curve;
+        if (FAILED(device->CreateTexture1D(&curve_desc, &curve_data, &curve_texture)) ||
+            FAILED(device->CreateShaderResourceView(curve_texture.Get(), nullptr, &curve_view))) {
+            klive_set_message("创建色调曲线纹理失败");
+            return false;
+        }
         return true;
+    }
+
+    void update_curve(ID3D11DeviceContext* context, const float* curve) {
+        if (!curve_texture) return;
+        context->UpdateSubresource(curve_texture.Get(), 0, nullptr, curve, 0, 0);
     }
 };
 
@@ -290,10 +362,15 @@ struct MirrorContext {
     ComPtr<IDXGISwapChain1> swap_chain;
     ComPtr<ID3D11RenderTargetView> render_target;
     Pipeline pipeline;
+    OsdOverlay osd;
     std::unique_ptr<FrameSource> source;
     int32_t resolved_kind = -1;
     int32_t resolved_index = -1;
     int64_t resolved_window = 0;
+    /* 当前采集源所属显示器的 SDR 白电平（nits），HDR 帧归一化用 */
+    float source_sdr_white_nits = 80.0f;
+    /* 已上传到曲线纹理的 LUT 版本；设备重建后置回哨兵值强制重传 */
+    uint32_t curve_version = 0xFFFFFFFFu;
     bool clear_next = false;
 };
 
@@ -369,6 +446,7 @@ bool ensure_device(MirrorContext& ctx, int32_t output_index, const char* stage) 
      */
     ctx.render_target.Reset();
     ctx.pipeline.reset();
+    ctx.osd.reset();
     ctx.swap_chain.Reset();
     if (ctx.context) {
         ctx.context->ClearState();
@@ -387,22 +465,45 @@ bool ensure_device(MirrorContext& ctx, int32_t output_index, const char* stage) 
     }
 
     ctx.device_output = output_index;
+    ctx.curve_version = 0xFFFFFFFFu;
     ctx.clear_next = true;
     return true;
 }
 
+/* 采集源所属显示器的 HDR 参数；窗口源按窗口当前所在显示器判断。 */
+const KliveOutput* source_output(const MirrorContext& ctx, int32_t kind, int32_t index,
+                                 int64_t handle) {
+    HMONITOR monitor = nullptr;
+    if (kind == KLIVE_SOURCE_WINDOW) {
+        monitor = MonitorFromWindow(reinterpret_cast<HWND>(static_cast<intptr_t>(handle)),
+                                    MONITOR_DEFAULTTONEAREST);
+    } else if (index >= 0 && index < static_cast<int32_t>(ctx.outputs->size())) {
+        monitor = (*ctx.outputs)[static_cast<size_t>(index)].desc.Monitor;
+    }
+    if (monitor == nullptr) return nullptr;
+    const int32_t found = find_output_by_monitor(*ctx.outputs, monitor);
+    return found >= 0 ? &(*ctx.outputs)[static_cast<size_t>(found)] : nullptr;
+}
+
 std::unique_ptr<FrameSource> create_source(MirrorContext& ctx, int32_t kind, int32_t index,
                                            int64_t handle) {
+    const KliveOutput* output = source_output(ctx, kind, index, handle);
+    const bool hdr = output != nullptr && output->hdr;
+
     if (kind == KLIVE_SOURCE_WINDOW) {
         return klive_create_wgc_window_source(reinterpret_cast<HWND>(static_cast<intptr_t>(handle)),
-                                              ctx.device.Get());
+                                              ctx.device.Get(), hdr);
     }
 
-    const KliveOutput& output = (*ctx.outputs)[static_cast<size_t>(index)];
-    if (ctx.capture_backend == KLIVE_CAPTURE_WGC) {
-        return klive_create_wgc_monitor_source(output.desc.Monitor, ctx.device.Get());
+    const KliveOutput& target = (*ctx.outputs)[static_cast<size_t>(index)];
+    /*
+     * HDR 显示器上桌面复制给的表面颜色编码不可靠（实测是未标注的 HDR 数据），
+     * 直接按 sRGB 画会发灰发暗；统一改用 WGC 的 FP16 帧 + 色调映射。
+     */
+    if (ctx.capture_backend == KLIVE_CAPTURE_WGC || hdr) {
+        return klive_create_wgc_monitor_source(target.desc.Monitor, ctx.device.Get(), hdr);
     }
-    return klive_create_duplication_source(output, ctx.device.Get());
+    return klive_create_duplication_source(target, ctx.device.Get());
 }
 
 /* 返回值：KLIVE_OK 成功；KLIVE_E_DEVICE 致命；其它为本次换源失败（下一轮重试）。 */
@@ -420,6 +521,9 @@ int32_t switch_source(MirrorContext& ctx, int32_t kind, int32_t index, int64_t h
         if (kind == KLIVE_SOURCE_WINDOW) return KLIVE_E_WINDOW;
         return ctx.capture_backend == KLIVE_CAPTURE_WGC ? KLIVE_E_CAPTURE : KLIVE_E_DUPLICATION;
     }
+
+    const KliveOutput* output = source_output(ctx, kind, index, handle);
+    ctx.source_sdr_white_nits = output != nullptr ? output->sdr_white_nits : 80.0f;
 
     ctx.source = std::move(next);
     ctx.resolved_kind = kind;
@@ -475,6 +579,23 @@ bool resolve_source(const MirrorContext& ctx, int32_t mode, int32_t& kind, int32
         default:
             return false;
     }
+}
+
+/* 把镜像画面画到当前 render target；着色器参数由调用方先写入常量缓冲。 */
+void draw_mirror_quad(MirrorContext& ctx, ID3D11ShaderResourceView* view) {
+    ctx.context->OMSetRenderTargets(1, ctx.render_target.GetAddressOf(), nullptr);
+    ctx.context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+    ctx.context->IASetInputLayout(nullptr);
+    ctx.context->RSSetState(ctx.pipeline.rasterizer.Get());
+    ctx.context->VSSetShader(ctx.pipeline.vertex.Get(), nullptr, 0);
+    ctx.context->VSSetConstantBuffers(0, 1, ctx.pipeline.params.GetAddressOf());
+    ctx.context->PSSetShader(ctx.pipeline.pixel.Get(), nullptr, 0);
+    // 像素着色器要用 gUvScale / gUvOffset 做缩放，常量缓冲必须也绑到 PS 阶段
+    ctx.context->PSSetConstantBuffers(0, 1, ctx.pipeline.params.GetAddressOf());
+    ctx.context->PSSetShaderResources(0, 1, &view);
+    ctx.context->PSSetShaderResources(1, 1, ctx.pipeline.curve_view.GetAddressOf());
+    ctx.context->PSSetSamplers(0, 1, ctx.pipeline.sampler.GetAddressOf());
+    ctx.context->Draw(4, 0);
 }
 
 int32_t run_mirror(KliveMirrorSession& session, const klive_mirror_config& config) {
@@ -580,11 +701,17 @@ int32_t run_mirror(KliveMirrorSession& session, const klive_mirror_config& confi
     auto last_fps_sample = Clock::now();
     auto last_probe = Clock::now() - kSourceProbeInterval;
     int64_t frames_since_sample = 0;
-    int32_t last_mode = -1;
+    // 与初始档位一致，启动时不要弹一条「全屏镜像」
+    int32_t last_mode = initial_mode;
     // 缩放中心：鼠标离开当前源显示器时保留最后一次有效位置，避免画面跳边
     float zoom_u = 0.5f;
     float zoom_v = 0.5f;
     bool quit = false;
+    // 切档提示：静态画面不会出新帧，靠 need_present 主动补一帧显示 / 擦除 OSD
+    bool osd_visible = false;
+    auto osd_deadline = Clock::now();
+    bool need_present = false;
+    bool scene_drawn = false;
 
     while (!quit && !session.stop.load()) {
         MSG msg;
@@ -609,7 +736,8 @@ int32_t run_mirror(KliveMirrorSession& session, const klive_mirror_config& confi
 
         const int32_t mode = session.mode.load();
         const auto now = Clock::now();
-        if (mode != last_mode || now - last_probe >= kSourceProbeInterval) {
+        const bool mode_changed = mode != last_mode;
+        if (mode_changed || now - last_probe >= kSourceProbeInterval) {
             last_mode = mode;
             last_probe = now;
             if (resolve_source(ctx, mode, want_kind, want_index, want_handle)) {
@@ -621,10 +749,47 @@ int32_t run_mirror(KliveMirrorSession& session, const klive_mirror_config& confi
                 if (code == KLIVE_OK) session.source_index = ctx.resolved_index;
             }
         }
+        if (mode_changed) {
+            ctx.osd.set_text(mode_label(mode), g_window.width);
+            osd_visible = true;
+            osd_deadline = now + kOsdDuration;
+            need_present = true;
+        }
+        if (osd_visible && now >= osd_deadline) {
+            osd_visible = false;
+            ctx.osd.hide();
+            // 暂停中的画面没有新帧，靠这一帧把 OSD 擦掉
+            need_present = true;
+        }
 
         if (!ctx.source) {
+            // 没有采集源时也要把刚切档的 OSD 画出来
+            if (need_present && ctx.render_target) {
+                const float clear[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+                ctx.context->ClearRenderTargetView(ctx.render_target.Get(), clear);
+                ctx.context->OMSetRenderTargets(1, ctx.render_target.GetAddressOf(), nullptr);
+                if (osd_visible) {
+                    ctx.osd.draw(ctx.context.Get(), ctx.device.Get(), g_window.width, g_window.height);
+                }
+                ctx.swap_chain->Present(ctx.vsync ? 1 : 0, 0);
+                scene_drawn = false;
+                need_present = false;
+            }
             Sleep(10);
             continue;
+        }
+
+        // 面板调完曲线后重传 LUT；静态画面没有新帧，靠 need_present 补一帧让它立刻可见
+        const uint32_t curve_version = session.curve_version.load();
+        if (curve_version != ctx.curve_version) {
+            float curve[KLIVE_TONE_CURVE_SIZE];
+            {
+                SrwExclusiveLock lock(session.curve_lock);
+                std::copy(std::begin(session.tone_curve), std::end(session.tone_curve), curve);
+            }
+            ctx.pipeline.update_curve(ctx.context.Get(), curve);
+            ctx.curve_version = curve_version;
+            need_present = true;
         }
 
         ComPtr<ID3D11Texture2D> frame_texture;
@@ -645,11 +810,22 @@ int32_t run_mirror(KliveMirrorSession& session, const klive_mirror_config& confi
         }
 
         if (!has_frame) {
-            if (ctx.clear_next && ctx.render_target) {
+            if (ctx.render_target && (ctx.clear_next || need_present)) {
                 const float clear[4] = {0.0f, 0.0f, 0.0f, 1.0f};
                 ctx.context->ClearRenderTargetView(ctx.render_target.Get(), clear);
+                ctx.context->OMSetRenderTargets(1, ctx.render_target.GetAddressOf(), nullptr);
+                // 旧画面仍代表当前内容时才补画；换源后必须先黑屏等新帧
+                if (!ctx.clear_next && scene_drawn) {
+                    ID3D11ShaderResourceView* frame_view = ctx.source->view();
+                    if (frame_view != nullptr) draw_mirror_quad(ctx, frame_view);
+                }
+                if (osd_visible) {
+                    ctx.osd.draw(ctx.context.Get(), ctx.device.Get(), g_window.width, g_window.height);
+                }
                 ctx.swap_chain->Present(ctx.vsync ? 1 : 0, 0);
+                if (ctx.clear_next) scene_drawn = false;
                 ctx.clear_next = false;
+                need_present = false;
             }
             continue;
         }
@@ -695,27 +871,22 @@ int32_t run_mirror(KliveMirrorSession& session, const klive_mirror_config& confi
             uv_offset_y = std::clamp(zoom_v - span * 0.5f, 0.0f, 1.0f - span);
         }
 
+        // WGC 的 HDR 帧池是 R16G16B16A16_FLOAT（scRGB 线性），需要着色器里转 SDR
+        const bool hdr_frame = desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT;
         ScaleParams params{{scale_x, scale_y},
                            {uv_scale_x, uv_scale_y},
                            {uv_offset_x, uv_offset_y},
-                           {0.0f, 0.0f}};
+                           {hdr_frame ? 1.0f : 0.0f,
+                            std::max(ctx.source_sdr_white_nits / 80.0f, 1.0f)}};
         ctx.context->UpdateSubresource(ctx.pipeline.params.Get(), 0, nullptr, &params, 0, 0);
 
         ID3D11ShaderResourceView* frame_view = ctx.source->view();
         const float clear[4] = {0.0f, 0.0f, 0.0f, 1.0f};
         ctx.context->ClearRenderTargetView(ctx.render_target.Get(), clear);
-        ctx.context->OMSetRenderTargets(1, ctx.render_target.GetAddressOf(), nullptr);
-        ctx.context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
-        ctx.context->IASetInputLayout(nullptr);
-        ctx.context->RSSetState(ctx.pipeline.rasterizer.Get());
-        ctx.context->VSSetShader(ctx.pipeline.vertex.Get(), nullptr, 0);
-        ctx.context->VSSetConstantBuffers(0, 1, ctx.pipeline.params.GetAddressOf());
-        ctx.context->PSSetShader(ctx.pipeline.pixel.Get(), nullptr, 0);
-        // 像素着色器要用 gUvScale / gUvOffset 做缩放，常量缓冲必须也绑到 PS 阶段
-        ctx.context->PSSetConstantBuffers(0, 1, ctx.pipeline.params.GetAddressOf());
-        ctx.context->PSSetShaderResources(0, 1, &frame_view);
-        ctx.context->PSSetSamplers(0, 1, ctx.pipeline.sampler.GetAddressOf());
-        ctx.context->Draw(4, 0);
+        draw_mirror_quad(ctx, frame_view);
+        if (osd_visible) {
+            ctx.osd.draw(ctx.context.Get(), ctx.device.Get(), g_window.width, g_window.height);
+        }
 
         const HRESULT hr = ctx.swap_chain->Present(ctx.vsync ? 1 : 0, 0);
         if (FAILED(hr)) {
@@ -724,6 +895,8 @@ int32_t run_mirror(KliveMirrorSession& session, const klive_mirror_config& confi
             break;
         }
         ctx.clear_next = false;
+        scene_drawn = true;
+        need_present = false;
 
         session.frames.fetch_add(1);
         session.frame_width = static_cast<int32_t>(desc.Width);
@@ -751,6 +924,21 @@ int32_t run_mirror(KliveMirrorSession& session, const klive_mirror_config& confi
 KliveMirrorSession g_session;
 
 }  // namespace
+
+void klive_default_tone_curve(float* out) {
+    constexpr float kKnee = 0.9f;
+    for (int32_t i = 0; i < KLIVE_TONE_CURVE_SIZE; ++i) {
+        const float x = 2.0f * static_cast<float>(i) / static_cast<float>(KLIVE_TONE_CURVE_SIZE - 1);
+        const float over = std::max(x - kKnee, 0.0f);
+        const float mapped =
+            std::min(x, kKnee) + (1.0f - kKnee) * over / std::max(over + (1.0f - kKnee), 1e-3f);
+        out[i] = std::clamp(mapped, 0.0f, 1.0f);
+    }
+}
+
+KliveMirrorSession::KliveMirrorSession() {
+    klive_default_tone_curve(tone_curve);
+}
 
 KliveMirrorSession& klive_session() {
     return g_session;

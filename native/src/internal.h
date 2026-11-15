@@ -38,12 +38,20 @@ struct KliveOutput {
     LUID luid{};
     int32_t index = 0;
     float refresh_hz = 0.0f;
+    /* 输出处于 HDR（scRGB / PQ）模式时为 true，采集帧会带 HDR 数据 */
+    bool hdr = false;
+    /* 显示器峰值亮度（nits），HDR 色调映射的肩部上限参考 */
+    float max_luminance = 0.0f;
+    /* HDR 模式下系统设定的 SDR 白电平（nits）；非 HDR 时无意义 */
+    float sdr_white_nits = 80.0f;
     char name[64]{};
     char friendly_name[96]{};
     char adapter_name[96]{};
 };
 
 struct KliveMirrorSession {
+    KliveMirrorSession();
+
     SRWLOCK lifecycle = SRWLOCK_INIT;
     std::thread worker;
     std::atomic<bool> running{false};
@@ -55,8 +63,15 @@ struct KliveMirrorSession {
     std::atomic<int32_t> frame_height{0};
     std::atomic<int32_t> mode{KLIVE_MODE_FULLSCREEN};
     std::atomic<int32_t> source_index{-1};
+    /* HDR 色调曲线（65 点 LUT），读改写都走 curve_lock；版本号用于渲染循环判断是否要重传 */
+    SRWLOCK curve_lock = SRWLOCK_INIT;
+    float tone_curve[KLIVE_TONE_CURVE_SIZE]{};
+    std::atomic<uint32_t> curve_version{0};
     klive_mirror_config config{};
 };
+
+/* 默认色调曲线：0.9 以下直通，之后用 C1 shoulder 压高光。 */
+void klive_default_tone_curve(float* out);
 
 std::vector<KliveOutput> klive_collect_outputs();
 

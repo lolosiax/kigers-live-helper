@@ -36,6 +36,7 @@ int32_t klive_enumerate_monitors(klive_monitor_desc* out, int32_t capacity) {
         desc.adapter_luid_low = entry.luid.LowPart;
         desc.adapter_luid_high = entry.luid.HighPart;
         desc.refresh_hz = entry.refresh_hz;
+        desc.hdr = entry.hdr ? 1 : 0;
         memcpy(desc.name, entry.name, sizeof(desc.name));
         memcpy(desc.friendly_name, entry.friendly_name, sizeof(desc.friendly_name));
         memcpy(desc.adapter_name, entry.adapter_name, sizeof(desc.adapter_name));
@@ -81,6 +82,25 @@ int32_t klive_set_mode(int32_t mode) {
 
 int32_t klive_get_mode(void) {
     return klive_session().mode.load();
+}
+
+int32_t klive_set_tone_curve(const float* values, int32_t count) {
+    KliveMirrorSession& session = klive_session();
+    if (values != nullptr && count != 0 && count != KLIVE_TONE_CURVE_SIZE) {
+        klive_set_message("色调曲线必须提供 %d 个采样点", KLIVE_TONE_CURVE_SIZE);
+        return KLIVE_E_INVALID_ARG;
+    }
+
+    SrwExclusiveLock lock(session.curve_lock);
+    if (values == nullptr || count == 0) {
+        klive_default_tone_curve(session.tone_curve);
+    } else {
+        for (int32_t i = 0; i < KLIVE_TONE_CURVE_SIZE; ++i) {
+            session.tone_curve[i] = std::clamp(values[i], 0.0f, 1.0f);
+        }
+    }
+    session.curve_version.fetch_add(1);
+    return KLIVE_OK;
 }
 
 int32_t klive_get_stats(klive_mirror_stats* out) {

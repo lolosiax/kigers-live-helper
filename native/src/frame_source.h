@@ -55,10 +55,11 @@ void klive_set_dxgi_error(const char* stage, HRESULT hr);
 std::unique_ptr<FrameSource> klive_create_duplication_source(const KliveOutput& output,
                                                              ID3D11Device* device);
 
+/* hdr = true 时申请 FP16 帧池，WGC 会给出 scRGB 线性帧（1.0 = 80 nits）。 */
 std::unique_ptr<FrameSource> klive_create_wgc_monitor_source(HMONITOR monitor,
-                                                             ID3D11Device* device);
+                                                             ID3D11Device* device, bool hdr);
 
-std::unique_ptr<FrameSource> klive_create_wgc_window_source(HWND window,
-                                                            ID3D11Device* device);
+std::unique_ptr<FrameSource> klive_create_wgc_window_source(HWND window, ID3D11Device* device,
+                                                            bool hdr);
 
 #endif /* KLIVE_FRAME_SOURCE_H */

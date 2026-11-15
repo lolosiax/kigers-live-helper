@@ -88,6 +88,7 @@ typedef struct klive_monitor_desc {
     int32_t adapter_luid_low;
     int32_t adapter_luid_high;
     float   refresh_hz;
+    int32_t hdr;               /* 1 = 输出处于 HDR（scRGB / PQ）模式，采集帧需要色调映射 */
     char    name[64];          /* DXGI 设备名，例如 "\\.\DISPLAY1" */
     char    friendly_name[96]; /* 显示器型号等，可能为空 */
     char    adapter_name[96];  /* 所在显卡名称 */
@@ -155,6 +156,17 @@ KLIVE_API int32_t klive_is_running(void);
 KLIVE_API int32_t klive_set_mode(int32_t mode);
 
 KLIVE_API int32_t klive_get_mode(void);
+
+/*
+ * HDR 色调曲线：把 scRGB 线性亮度映射到 SDR 线性亮度。
+ *
+ * 65 个采样点，等距覆盖输入 0..2（1.0 = SDR 白），输出 0..1；着色器按线性插值查表。
+ * values 为空或 count 为 0 时恢复默认曲线（0.9 前线性、之后 C1 shoulder）。
+ * 运行中修改下一帧生效；静态画面也会主动补一帧，便于面板边拖边看。
+ */
+enum { KLIVE_TONE_CURVE_SIZE = 65 };
+
+KLIVE_API int32_t klive_set_tone_curve(const float* values, int32_t count);
 
 KLIVE_API int32_t klive_get_stats(klive_mirror_stats* out);
 

@@ -13,6 +13,7 @@ class MockMirrorEngine : MirrorEngine {
     private var mode = MirrorMode.Fullscreen
     private var sourceIndex: Int? = 0
     private var targetIndex: Int? = 1
+    private var toneCurve = ToneCurve.Default
 
     private val sampleMonitors = listOf(
         MonitorInfo(
@@ -28,6 +29,7 @@ class MockMirrorEngine : MirrorEngine {
             adapterLuidLow = 1,
             adapterLuidHigh = 0,
             refreshHz = 60f,
+            hdr = true,
         ),
         MonitorInfo(
             index = 1,
@@ -100,13 +102,21 @@ class MockMirrorEngine : MirrorEngine {
     override suspend fun lastMessage(): String? = null
 
     override suspend fun settings(): MirrorSettings =
-        MirrorSettings(mode = mode, sourceIndex = sourceIndex, targetIndex = targetIndex)
+        MirrorSettings(
+            mode = mode,
+            sourceIndex = sourceIndex,
+            targetIndex = targetIndex,
+            toneCurve = toneCurve.values,
+        )
 
     override suspend fun saveSettings(settings: MirrorSettings) {
         mode = settings.mode
         sourceIndex = settings.sourceIndex ?: sourceIndex
         targetIndex = settings.targetIndex ?: targetIndex
+        toneCurve = ToneCurve(settings.toneCurve)
     }
+
+    override suspend fun setToneCurve(lut: List<Float>) = Unit
 
     override suspend fun openConsole(): String? = null
 

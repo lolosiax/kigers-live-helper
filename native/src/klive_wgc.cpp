@@ -73,8 +73,11 @@ ComPtr<ID3D11Texture2D> texture_from_surface(
 /** WGC 后端：显示器与窗口都能采，且可以与其它程序同时采集同一画面。 */
 class WgcSource final : public FrameSource {
 public:
-    WgcSource(GraphicsCaptureItem item, const char* label)
-        : item_(std::move(item)), label_(label) {}
+    WgcSource(GraphicsCaptureItem item, const char* label, bool hdr)
+        : item_(std::move(item)),
+          label_(label),
+          pixel_format_(hdr ? DirectXPixelFormat::R16G16B16A16Float
+                            : DirectXPixelFormat::B8G8R8A8UIntNormalized) {}
 
     bool open(ID3D11Device* device) {
         device_ = device;
@@ -83,8 +86,8 @@ public:
             rt_device_ = create_rt_device(device);
 
             const SizeInt32 size = item_.Size();
-            pool_ = Direct3D11CaptureFramePool::CreateFreeThreaded(
-                rt_device_, DirectXPixelFormat::B8G8R8A8UIntNormalized, kFrameCount, size);
+            pool_ = Direct3D11CaptureFramePool::CreateFreeThreaded(rt_device_, pixel_format_,
+                                                                   kFrameCount, size);
             session_ = pool_.CreateCaptureSession(item_);
             session_.IsCursorCaptureEnabled(true);
             disable_border();
@@ -117,8 +120,7 @@ public:
                 pool_height_ = size.Height;
                 frame.Close();
                 if (size.Width > 0 && size.Height > 0) {
-                    pool_.Recreate(rt_device_, DirectXPixelFormat::B8G8R8A8UIntNormalized, kFrameCount,
-                                   size);
+                    pool_.Recreate(rt_device_, pixel_format_, kFrameCount, size);
                 }
                 return false;
             }
@@ -169,6 +171,7 @@ private:
 
     GraphicsCaptureItem item_{nullptr};
     const char* label_ = "WGC";
+    const DirectXPixelFormat pixel_format_;
     ComPtr<ID3D11Device> device_;
     IDirect3DDevice rt_device_{nullptr};
     Direct3D11CaptureFramePool pool_{nullptr};
@@ -181,14 +184,15 @@ private:
 }  // namespace
 
 std::unique_ptr<FrameSource> klive_create_wgc_monitor_source(HMONITOR monitor,
-                                                             ID3D11Device* device) {
+                                                             ID3D11Device* device, bool hdr) {
     if (monitor == nullptr) {
         klive_set_message("该显示器不支持 WGC 采集");
         return nullptr;
     }
     try {
         ensure_apartment();
-        auto source = std::make_unique<WgcSource>(create_item(monitor, nullptr), "WGC 显示器");
+        auto source =
+            std::make_unique<WgcSource>(create_item(monitor, nullptr), "WGC 显示器", hdr);
         if (!source->open(device)) return nullptr;
         return source;
     } catch (winrt::hresult_error const& e) {
@@ -198,14 +202,15 @@ std::unique_ptr<FrameSource> klive_create_wgc_monitor_source(HMONITOR monitor,
     }
 }
 
-std::unique_ptr<FrameSource> klive_create_wgc_window_source(HWND window, ID3D11Device* device) {
+std::unique_ptr<FrameSource> klive_create_wgc_window_source(HWND window, ID3D11Device* device,
+                                                            bool hdr) {
     if (window == nullptr || !IsWindow(window)) {
         klive_set_message("窗口已关闭或不可采集");
         return nullptr;
     }
     try {
         ensure_apartment();
-        auto source = std::make_unique<WgcSource>(create_item(nullptr, window), "WGC 窗口");
+        auto source = std::make_unique<WgcSource>(create_item(nullptr, window), "WGC 窗口", hdr);
         if (!source->open(device)) return nullptr;
         return source;
     } catch (winrt::hresult_error const& e) {

@@ -12,6 +12,7 @@ add_library(klive_capture SHARED
     src/klive_exports.cpp
     src/klive_monitor.cpp
     src/klive_mirror.cpp
+    src/klive_osd.cpp
     src/frame_source.cpp
     src/klive_duplication.cpp
     src/klive_wgc.cpp

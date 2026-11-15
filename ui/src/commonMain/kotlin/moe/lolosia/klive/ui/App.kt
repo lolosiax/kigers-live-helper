@@ -1,9 +1,11 @@
 package moe.lolosia.klive.ui
 
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -20,6 +22,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
@@ -33,11 +36,16 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -53,6 +61,7 @@ import moe.lolosia.klive.model.MirrorSettings
 import moe.lolosia.klive.model.MirrorStats
 import moe.lolosia.klive.model.MonitorInfo
 import moe.lolosia.klive.model.ScaleMode
+import moe.lolosia.klive.model.ToneCurve
 import moe.lolosia.klive.model.WindowInfo
 import kotlin.math.roundToInt
 
@@ -73,6 +82,10 @@ fun App(engine: MirrorEngine) {
     var stats by remember { mutableStateOf(MirrorStats.Idle) }
     var message by remember { mutableStateOf<String?>(null) }
     var settingsReady by remember { mutableStateOf(false) }
+    /** HDR 色调曲线；控制点纵坐标可拖，LUT 实时推给原生层。 */
+    var toneCurve by remember { mutableStateOf(ToneCurve.Default) }
+    /** 正在调 HDR 参数的那台显示器；非空时弹出调参窗口。 */
+    var hdrDialog by remember { mutableStateOf<MonitorInfo?>(null) }
 
     val scope = rememberCoroutineScope()
 
@@ -108,18 +121,21 @@ fun App(engine: MirrorEngine) {
         if (saved != null) {
             val indices = monitors.map { it.index }
             mode = saved.mode
+            toneCurve = ToneCurve(saved.toneCurve)
             saved.sourceIndex?.takeIf { it in indices }?.let { sourceIndex = it }
             saved.targetIndex?.takeIf { it in indices }?.let { targetIndex = it }
             if (sourceIndex == targetIndex) {
                 targetIndex = indices.firstOrNull { it != sourceIndex } ?: targetIndex
             }
         }
+        // 原生层有同样的默认曲线，这里再推一次，保证面板看到的与画面上的一致
+        engine.setToneCurve(toneCurve.lut())
         settingsReady = true
     }
 
     LaunchedEffect(settingsReady, mode, sourceIndex, targetIndex) {
         if (!settingsReady) return@LaunchedEffect
-        engine.saveSettings(MirrorSettings(mode, sourceIndex, targetIndex))
+        engine.saveSettings(MirrorSettings(mode, sourceIndex, targetIndex, toneCurve.values))
     }
 
     LaunchedEffect(Unit) {
@@ -178,6 +194,7 @@ fun App(engine: MirrorEngine) {
                 selectedWindow = windowHandle,
                 onSelectMonitor = { sourceIndex = it },
                 onSelectWindow = { windowHandle = it },
+                onOpenHdr = { hdrDialog = it },
                 modifier = Modifier.weight(1f).fillMaxHeight(),
             )
             MirrorArrow()
@@ -250,6 +267,32 @@ fun App(engine: MirrorEngine) {
                     engine.stop()
                     running = false
                     stats = engine.stats()
+                }
+            },
+        )
+    }
+
+    val hdrMonitor = hdrDialog
+    if (hdrMonitor != null) {
+        HdrToneDialog(
+            monitor = hdrMonitor,
+            curve = toneCurve,
+            onCurveChange = { curve ->
+                toneCurve = curve
+                scope.launch { engine.setToneCurve(curve.lut()) }
+            },
+            onDismiss = {
+                hdrDialog = null
+                // 拖曲线时只改运行参数，关闭弹窗才落盘
+                scope.launch {
+                    engine.saveSettings(
+                        MirrorSettings(
+                            mode = mode,
+                            sourceIndex = sourceIndex,
+                            targetIndex = targetIndex,
+                            toneCurve = toneCurve.values,
+                        ),
+                    )
                 }
             },
         )
@@ -342,6 +385,7 @@ private fun SourcePanel(
     selectedWindow: Long?,
     onSelectMonitor: (Int) -> Unit,
     onSelectWindow: (Long) -> Unit,
+    onOpenHdr: (MonitorInfo) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val accent = MaterialTheme.colorScheme.primary
@@ -406,6 +450,7 @@ private fun SourcePanel(
                                 selected = monitor.index == selectedMonitor,
                                 accent = accent,
                                 onClick = { onSelectMonitor(monitor.index) },
+                                onOptions = if (monitor.hdr) ({ onOpenHdr(monitor) }) else null,
                             )
                         }
                     }
@@ -562,7 +607,13 @@ private fun MonitorPanel(
 }
 
 @Composable
-private fun MonitorRow(monitor: MonitorInfo, selected: Boolean, accent: Color, onClick: () -> Unit) {
+private fun MonitorRow(
+    monitor: MonitorInfo,
+    selected: Boolean,
+    accent: Color,
+    onClick: () -> Unit,
+    onOptions: (() -> Unit)? = null,
+) {
     val shape = RoundedCornerShape(12.dp)
     val background = if (selected) accent.copy(alpha = 0.12f) else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f)
     val borderColor = if (selected) accent.copy(alpha = 0.65f) else MaterialTheme.colorScheme.outline
@@ -603,6 +654,10 @@ private fun MonitorRow(monitor: MonitorInfo, selected: Boolean, accent: Color, o
                     Spacer(Modifier.width(6.dp))
                     PrimaryBadge()
                 }
+                if (monitor.hdr) {
+                    Spacer(Modifier.width(6.dp))
+                    HdrBadge()
+                }
             }
             Spacer(Modifier.height(2.dp))
             Text(
@@ -619,11 +674,41 @@ private fun MonitorRow(monitor: MonitorInfo, selected: Boolean, accent: Color, o
             }
         }
         Spacer(Modifier.width(8.dp))
+        if (onOptions != null) {
+            // 单独的调参入口：点击不能连带选中这一行
+            Box(
+                modifier = Modifier
+                    .clip(RoundedCornerShape(8.dp))
+                    .clickable(onClick = onOptions)
+                    .padding(horizontal = 8.dp, vertical = 2.dp),
+            ) {
+                Text(
+                    // 用中间点拼三个点：楷体/等线里 ⋮ 这类数学符号不一定有字形
+                    "···",
+                    style = MaterialTheme.typography.titleMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            Spacer(Modifier.width(4.dp))
+        }
         Text(
             if (selected) "已选" else "选择",
             style = MaterialTheme.typography.labelSmall,
             color = if (selected) accent else MaterialTheme.colorScheme.onSurfaceVariant,
         )
+    }
+}
+
+@Composable
+private fun HdrBadge() {
+    val color = MaterialTheme.colorScheme.tertiary
+    Box(
+        modifier = Modifier
+            .clip(RoundedCornerShape(50))
+            .background(color.copy(alpha = 0.16f))
+            .padding(horizontal = 6.dp, vertical = 1.dp),
+    ) {
+        Text("HDR", style = MaterialTheme.typography.labelSmall, color = color)
     }
 }
 
@@ -793,5 +878,144 @@ private fun StatBlock(label: String, value: String) {
             style = MaterialTheme.typography.titleMedium,
             fontWeight = FontWeight.SemiBold,
         )
+    }
+}
+
+/**
+ * HDR 色调映射调参窗口。
+ *
+ * 曲线是采集侧（原生着色器）的全局参数：所有 HDR 采集源共用一份，
+ * 因此从任意 HDR 显示器打开都是同一条。
+ */
+@Composable
+private fun HdrToneDialog(
+    monitor: MonitorInfo,
+    curve: ToneCurve,
+    onCurveChange: (ToneCurve) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("HDR 色调曲线") },
+        text = {
+            Column {
+                Text(
+                    "${monitor.displayName} · 所有 HDR 采集源共用",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Spacer(Modifier.height(12.dp))
+                ToneCurveEditor(
+                    curve = curve,
+                    onCurveChange = onCurveChange,
+                    modifier = Modifier.fillMaxWidth().height(200.dp),
+                )
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    "横轴：输入亮度 0–2（1.0 = SDR 白）· 纵轴：输出 0–1",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Spacer(Modifier.height(10.dp))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        "拖动圆点改曲线：往下压暗，往上是提亮。",
+                        modifier = Modifier.weight(1f),
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    TextButton(onClick = { onCurveChange(ToneCurve.Default) }) { Text("恢复默认") }
+                }
+            }
+        },
+        confirmButton = { TextButton(onClick = onDismiss) { Text("完成") } },
+    )
+}
+
+/** 曲线编辑画布：控制点横坐标固定，拖动只改纵坐标。 */
+@Composable
+private fun ToneCurveEditor(
+    curve: ToneCurve,
+    onCurveChange: (ToneCurve) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val latest = rememberUpdatedState(curve)
+    val accent = MaterialTheme.colorScheme.primary
+    val grid = MaterialTheme.colorScheme.outline
+    val handleFill = MaterialTheme.colorScheme.surface
+    var active by remember { mutableStateOf(-1) }
+    val lut = remember(curve) { curve.lut() }
+
+    Canvas(
+        modifier = modifier
+            .clip(RoundedCornerShape(10.dp))
+            .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.35f))
+            .border(1.dp, MaterialTheme.colorScheme.outline, RoundedCornerShape(10.dp))
+            .pointerInput(Unit) {
+                val width = size.width.toFloat()
+                val height = size.height.toFloat()
+                fun pick(position: Offset): Int {
+                    val points = latest.value.sanitized()
+                    var best = 0
+                    var bestDistance = Float.MAX_VALUE
+                    points.forEachIndexed { index, value ->
+                        val dx = width * ToneCurve.Knots[index] / ToneCurve.MaxInput - position.x
+                        val dy = height * (1f - value) - position.y
+                        val distance = dx * dx + dy * dy
+                        if (distance < bestDistance) {
+                            bestDistance = distance
+                            best = index
+                        }
+                    }
+                    return best
+                }
+                detectDragGestures(
+                    onDragStart = { position -> active = pick(position) },
+                    onDragEnd = { active = -1 },
+                    onDragCancel = { active = -1 },
+                    onDrag = { change, _ ->
+                        val index = active
+                        if (index >= 0) {
+                            val values = latest.value.sanitized().toMutableList()
+                            values[index] = (1f - change.position.y / height).coerceIn(0f, 1f)
+                            onCurveChange(ToneCurve(values))
+                            change.consume()
+                        }
+                    },
+                )
+            },
+    ) {
+        fun px(x: Float) = size.width * x / ToneCurve.MaxInput
+        fun py(y: Float) = size.height * (1f - y.coerceIn(0f, 1f))
+
+        // 网格（1/4 步进）与 SDR 白参考线
+        for (step in 1 until 4) {
+            val gx = px(ToneCurve.MaxInput * step / 4f)
+            drawLine(grid.copy(alpha = 0.18f), Offset(gx, 0f), Offset(gx, size.height), 1.dp.toPx())
+            val gy = py(step / 4f)
+            drawLine(grid.copy(alpha = 0.18f), Offset(0f, gy), Offset(size.width, gy), 1.dp.toPx())
+        }
+        drawLine(grid.copy(alpha = 0.45f), Offset(px(1f), 0f), Offset(px(1f), size.height), 1.dp.toPx())
+
+        // 对角线参考：输入 == 输出
+        drawLine(grid.copy(alpha = 0.45f), Offset(px(0f), py(0f)), Offset(px(1f), py(1f)), 1.dp.toPx())
+
+        val path = Path()
+        lut.forEachIndexed { index, value ->
+            val x = ToneCurve.MaxInput * index / (lut.size - 1)
+            if (index == 0) path.moveTo(px(x), py(value)) else path.lineTo(px(x), py(value))
+        }
+        drawPath(path, accent, style = Stroke(width = 2.dp.toPx()))
+
+        curve.sanitized().forEachIndexed { index, value ->
+            val center = Offset(px(ToneCurve.Knots[index]), py(value))
+            drawCircle(handleFill, 6.dp.toPx(), center)
+            drawCircle(
+                if (index == active) accent else handleFill,
+                6.dp.toPx(),
+                center,
+                style = Stroke(width = 2.dp.toPx()),
+            )
+        }
     }
 }

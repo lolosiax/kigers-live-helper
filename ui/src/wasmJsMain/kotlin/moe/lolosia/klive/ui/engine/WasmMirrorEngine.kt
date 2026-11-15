@@ -35,6 +35,7 @@ class WasmMirrorEngine(private val bridge: Bridge) : MirrorEngine {
                 adapterLuidLow = dto.adapterLuidLow,
                 adapterLuidHigh = dto.adapterLuidHigh,
                 refreshHz = dto.refreshHz,
+                hdr = dto.hdr,
             )
         }
     }
@@ -95,6 +96,10 @@ class WasmMirrorEngine(private val bridge: Bridge) : MirrorEngine {
             mode = MirrorMode.fromCode(result["mode"]?.jsonPrimitive?.intOrNull ?: 0),
             sourceIndex = result["sourceIndex"]?.jsonPrimitive?.intOrNull?.takeIf { it >= 0 },
             targetIndex = result["targetIndex"]?.jsonPrimitive?.intOrNull?.takeIf { it >= 0 },
+            toneCurve = result["toneCurve"]?.jsonArray
+                ?.mapNotNull { it.jsonPrimitive.floatOrNull }
+                ?.takeIf { it.isNotEmpty() }
+                ?: ToneCurve.DefaultValues,
         )
     }.getOrNull()
 
@@ -106,7 +111,17 @@ class WasmMirrorEngine(private val bridge: Bridge) : MirrorEngine {
                     put("mode", settings.mode.code)
                     put("sourceIndex", settings.sourceIndex ?: -1)
                     put("targetIndex", settings.targetIndex ?: -1)
+                    putJsonArray("toneCurve") { settings.toneCurve.forEach { add(it) } }
                 },
+            )
+        }
+    }
+
+    override suspend fun setToneCurve(lut: List<Float>) {
+        runCatching {
+            bridge.call(
+                "setToneCurve",
+                buildJsonObject { putJsonArray("lut") { lut.forEach { add(it) } } },
             )
         }
     }

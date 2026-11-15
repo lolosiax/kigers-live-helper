@@ -17,6 +17,7 @@ internal data class MonitorDto(
     val adapterLuidLow: Int = 0,
     val adapterLuidHigh: Int = 0,
     val refreshHz: Float = 0f,
+    val hdr: Boolean = false,
 )
 
 /** 窗口句柄是 64 位，JSON 里用字符串传，避免 JS number 精度损失。 */
